@@ -106,8 +106,11 @@ for (const d of decisions) {
       // Mark ready for review — this triggers the Copilot automated review
       // (Copilot does not review drafts). No marker needed: isDraft flips to
       // false, so this branch is naturally not re-entered.
+      // Uses COPILOT_TOKEN: the default GITHUB_TOKEN cannot call
+      // markPullRequestReadyForReview ("Resource not accessible by integration"),
+      // so un-drafting needs the user-to-server token (same as the @copilot ping).
       if (dryRun) { console.log(`  [dry-run] ${tag}: would mark ready for review (triggers Copilot review)`); undrafted++; continue; }
-      markReady(d.prNumber, ghRead);
+      markReady(d.prNumber, ghCopilot);
       console.log(`  ${tag}: marked ready for review (Copilot review will follow)`);
       undrafted++;
 

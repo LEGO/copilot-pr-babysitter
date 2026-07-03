@@ -95,8 +95,8 @@ jobs:
 
 ## Two tokens — why
 
-- **`github-token`** (default `GITHUB_TOKEN`) reads PRs/timeline/checks, re-runs failed jobs, and posts marker comments. It **cannot** wake the Copilot coding agent.
-- **`copilot-token`** authors the `@copilot` mention that actually triggers the agent — an OAuth **user-to-server** token from a **Copilot-licensed** account. For a POC you can bottle a personal `gh auth token`; **for production use a dedicated GitHub OAuth App + a Copilot-licensed service account** (a personal token is disposable and expires).
+- **`github-token`** (default `GITHUB_TOKEN`) reads PRs/timeline/checks, re-runs failed jobs, and posts marker comments. It **cannot** wake the Copilot coding agent, and it **cannot mark a PR ready for review** (`markPullRequestReadyForReview` returns "Resource not accessible by integration" for the Actions token).
+- **`copilot-token`** authors the `@copilot` mention that triggers the agent **and** un-drafts PRs (mark-ready) — an OAuth **user-to-server** token from a **Copilot-licensed** account. For a POC you can bottle a personal `gh auth token`; **for production use a dedicated GitHub OAuth App + a Copilot-licensed service account** (a personal token is disposable and expires).
 
 ## Cost
 
