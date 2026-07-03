@@ -58,6 +58,8 @@ jobs:
       contents: read
       actions: write         # re-run failed jobs
       pull-requests: write   # marker comments
+      checks: read           # read CI check-runs
+      statuses: read         # read legacy commit statuses
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: LEGO/copilot-pr-babysitter@v1
@@ -75,7 +77,7 @@ jobs:
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `title-pattern` | ⬜ | `''` | Identifier that must appear anywhere in the PR title (e.g. `PMO-`). Regex if it has metacharacters, else substring. Empty = all Copilot PRs. |
-| `github-token` | ⬜ | `${{ github.token }}` | Reads, job re-runs, marker comments. Needs `contents:read` + `actions:write` + `pull-requests:write`. |
+| `github-token` | ⬜ | `${{ github.token }}` | Reads, job re-runs, marker comments. Needs `contents:read` + `actions:write` + `pull-requests:write` + `checks:read` + `statuses:read`. |
 | `copilot-token` | ✅ | — | OAuth **user-to-server** token from a Copilot-licensed account; authors the `@copilot` mention. |
 | `anthropic-base-url` | ✅ | — | Base URL for the Anthropic-compatible model endpoint. |
 | `anthropic-auth-token` | ✅ | — | Bearer token for the model endpoint. Pass from a secret. |
@@ -104,7 +106,7 @@ Claude runs headless with `--allowedTools Read Grep Glob` — no writes, no shel
 
 ## Setup
 
-- **GitHub**: the job needs `contents:read`, `actions:write`, `pull-requests:write`.
+- **GitHub**: the job needs `contents:read`, `actions:write`, `pull-requests:write`, `checks:read`, `statuses:read`.
 - **Copilot**: a Copilot-licensed account and its OAuth user-to-server token.
 - **Teams** (optional): a Power Automate / incoming webhook URL.
 - **Model**: an Anthropic-compatible endpoint reachable from GitHub-hosted runners.

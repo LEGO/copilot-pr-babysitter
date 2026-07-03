@@ -29,6 +29,8 @@ jobs:
       contents: read
       actions: write         # re-run failed jobs
       pull-requests: write   # marker comments
+      checks: read           # read CI check-runs
+      statuses: read         # read legacy commit statuses
     steps:
       - uses: actions/checkout@v7.0.0
 

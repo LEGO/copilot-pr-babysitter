@@ -59,23 +59,38 @@ function getComments(number) {
   const raw = ghJson(['api', `repos/${owner}/${repo}/issues/${number}/comments`, '--paginate'], ghOpts);
   return raw.map((c) => ({ body: c.body, createdAt: c.created_at }));
 }
-function getReviewThreads(number) {
+// One GraphQL round-trip for everything on the PR object: draft state, reviews
+// (who reviewed + when), and inline review threads.
+function getReviewState(number) {
   const data = ghGraphql(`
     { repository(owner:"${owner}", name:"${repo}") { pullRequest(number:${number}) {
+      isDraft
+      reviews(first:50) { nodes { author{login} state submittedAt } }
       reviewThreads(first:100) { nodes {
         isResolved
         comments(first:1){ nodes { author{login} body path } }
       } } } } }`, ghOpts);
-  return data.repository.pullRequest.reviewThreads.nodes.map((t) => ({
-    isResolved: t.isResolved,
-    author: t.comments.nodes[0]?.author?.login || '',
-    body: t.comments.nodes[0]?.body || '',
-    path: t.comments.nodes[0]?.path || '',
-  }));
+  const pr = data.repository.pullRequest;
+  return {
+    isDraft: pr.isDraft,
+    reviews: pr.reviews.nodes.map((r) => ({ author: r.author?.login || '', state: r.state, submittedAt: r.submittedAt })),
+    threads: pr.reviewThreads.nodes.map((t) => ({
+      isResolved: t.isResolved,
+      author: t.comments.nodes[0]?.author?.login || '',
+      body: t.comments.nodes[0]?.body || '',
+      path: t.comments.nodes[0]?.path || '',
+    })),
+  };
 }
-function getChecks(number) {
-  const d = ghJson(['pr', 'view', String(number), '--repo', `${owner}/${repo}`, '--json', 'statusCheckRollup'], ghOpts);
-  return classifyChecks(d.statusCheckRollup || []);
+function getHeadSha(number) {
+  return ghJson(['pr', 'view', String(number), '--repo', `${owner}/${repo}`, '--json', 'headRefOid'], ghOpts).headRefOid;
+}
+// CI via REST (checks:read / statuses:read) — avoids the statusCheckRollup
+// GraphQL path, which the default GITHUB_TOKEN cannot access on some repos.
+function getChecks(sha) {
+  const cr = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/check-runs`, '--paginate'], ghOpts);
+  const st = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/status`], ghOpts);
+  return classifyChecks({ checkRuns: cr.check_runs || [], statuses: st.statuses || [] });
 }
 function getDiff(number) {
   const d = gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], ghOpts);
@@ -157,9 +172,9 @@ for (const pr of prs) {
     if (alreadyPosted) { console.log('  already posted ready + no new work since → skip'); decisions.push({ ...base, action: 'skip', reason: 'ready already posted' }); continue; }
 
     // (2) Comments first.
-    const threads = getReviewThreads(n);
+    const { isDraft, reviews, threads } = getReviewState(n);
     const openReviewer = threads.filter((t) => !t.isResolved && t.author === COPILOT_REVIEWER);
-    const checks = getChecks(n);
+    const checks = getChecks(getHeadSha(n));
     const failing = checks.filter((c) => c.state === 'fail');
     const pending = checks.filter((c) => c.state === 'pending');
 
@@ -217,9 +232,28 @@ for (const pr of prs) {
       continue;
     }
 
-    // (4) Terminal: idle, no open reviewer threads, CI green.
-    decisions.push({ ...base, action: 'ready', reason: 'CI green, reviews resolved, agent idle' });
-    console.log('  → ready for review');
+    // (4) Terminal candidate: idle, no open reviewer threads, CI green.
+    // But "no open threads" is vacuously true before the reviewer has even run.
+    // Only declare ready if the Copilot reviewer has actually reviewed the
+    // CURRENT head — a review from it that post-dates the last work_finished —
+    // and the PR is out of draft. Otherwise the review is still pending: skip
+    // and wait (Copilot auto-requests its own review when it finishes work).
+    const reviewerReviews = reviews
+      .filter((r) => r.author === COPILOT_REVIEWER && r.submittedAt)
+      .map((r) => new Date(r.submittedAt));
+    const newestReview = newestOf(reviewerReviews);
+    const reviewedCurrent = newestReview && (!workFinished || newestReview >= workFinished);
+
+    if (isDraft) {
+      console.log('  clean but still a draft → skip (not yet up for review)');
+      decisions.push({ ...base, action: 'skip', reason: 'PR is a draft' });
+    } else if (!reviewedCurrent) {
+      console.log('  clean but Copilot reviewer has not reviewed current head → skip (await review)');
+      decisions.push({ ...base, action: 'skip', reason: 'awaiting Copilot review of current head' });
+    } else {
+      decisions.push({ ...base, action: 'ready', reason: 'CI green, Copilot review clean on current head, agent idle' });
+      console.log('  → ready for review');
+    }
   } catch (err) {
     const msg = (err.stderr || err.message || String(err)).toString().slice(0, 400);
     console.error(`::warning::#${n}: assess failed: ${msg}`);

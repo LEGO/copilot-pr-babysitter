@@ -62,25 +62,30 @@ export function parseMarkers(comments) {
 }
 export const newestOf = (dates) => (dates.length ? new Date(Math.max(...dates.map((d) => +d))) : null);
 
-// -------- CI rollup classification --------
-// statusCheckRollup mixes CheckRun (status/conclusion) and StatusContext (state).
+// -------- CI classification (REST) --------
+// We read CI from two REST endpoints (both need only checks:read / statuses:read),
+// avoiding gh's statusCheckRollup GraphQL which requires broader integration
+// access than the default GITHUB_TOKEN grants:
+//   GET /repos/{o}/{r}/commits/{ref}/check-runs  → modern CheckRuns
+//   GET /repos/{o}/{r}/commits/{ref}/status      → legacy combined StatusContexts
 // Normalise both to { name, state: 'pass'|'fail'|'pending', runId }.
-const FAIL_CONCLUSIONS = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE']);
-const PASS_CONCLUSIONS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+const FAIL_CONCLUSIONS = new Set(['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale']);
+const PASS_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 
-export function classifyChecks(rollup = []) {
+// check-runs: [{ name, status, conclusion, details_url }]
+// combined status: { statuses: [{ context, state }] }
+export function classifyChecks({ checkRuns = [], statuses = [] } = {}) {
   const checks = [];
-  for (const c of rollup) {
-    if (c.__typename === 'CheckRun') {
-      let state = 'pending';
-      if (c.status === 'COMPLETED') state = FAIL_CONCLUSIONS.has(c.conclusion) ? 'fail' : PASS_CONCLUSIONS.has(c.conclusion) ? 'pass' : 'pending';
-      // parse run id from detailsUrl: .../actions/runs/<runId>/job/<jobId>
-      const runId = (String(c.detailsUrl || '').match(/\/actions\/runs\/(\d+)/) || [])[1] || null;
-      checks.push({ name: c.name, state, runId });
-    } else if (c.__typename === 'StatusContext') {
-      const s = c.state === 'SUCCESS' ? 'pass' : (c.state === 'PENDING' || c.state === 'EXPECTED') ? 'pending' : 'fail';
-      checks.push({ name: c.context, state: s, runId: null });
-    }
+  for (const c of checkRuns) {
+    let state = 'pending';
+    if (c.status === 'completed') state = FAIL_CONCLUSIONS.has(c.conclusion) ? 'fail' : PASS_CONCLUSIONS.has(c.conclusion) ? 'pass' : 'pending';
+    // parse run id from details_url: .../actions/runs/<runId>/job/<jobId>
+    const runId = (String(c.details_url || '').match(/\/actions\/runs\/(\d+)/) || [])[1] || null;
+    checks.push({ name: c.name, state, runId });
+  }
+  for (const s of statuses) {
+    const state = s.state === 'success' ? 'pass' : (s.state === 'pending' || s.state === 'expected') ? 'pending' : 'fail';
+    checks.push({ name: s.context, state, runId: null });
   }
   return checks;
 }
