@@ -9,15 +9,17 @@ On each run (you own the cron), for every open Copilot PR matching your title id
 1. **Idempotency gate** — is Copilot mid-flight, or have we already pinged and it hasn't started yet? If so, hands off.
 2. **Review comments first** — unresolved threads from the Copilot reviewer → a fresh **read-only Claude session** synthesises a concrete fix instruction → **`@copilot` ping**.
 3. **CI next** (only when the comment queue is empty) — Claude attributes each failing check: **flaky** → re-run the job (capped); **caused by the PR** → `@copilot` ping to fix.
-4. **Ready** — idle **and** no unresolved reviewer threads **and** CI green → post a **Teams "ready for review"** card and stop.
+4. **Un-draft to trigger review** — Copilot opens PRs as drafts and **only reviews once a PR is marked ready for review**. So when a draft is idle with green CI, the babysitter marks it ready (`gh pr ready`) to trigger the Copilot review. This is programmatic — the draft is not a manual gate.
+5. **Ready for a human** — not a draft **and** the Copilot reviewer has reviewed the current head **and** no unresolved reviewer threads **and** CI green → post a **Teams "ready for review"** card and stop.
 
 ```
 cron / manual dispatch (in YOUR workflow)
   → fetch open Copilot PRs matching <title-pattern>
-  → per PR:  idempotency gate → comments? → CI? → ready?
-       ping  : @copilot <instruction>            (+ hidden ping-marker = race guard)
-       rerun : gh run rerun --failed             (+ hidden rerun-marker, capped)
-       ready : Teams "ready for review" card      (+ hidden ready-marker = re-arm anchor)
+  → per PR:  idempotency gate → comments? → CI? → draft? → reviewed & clean?
+       ping    : @copilot <instruction>          (+ hidden ping-marker = race guard)
+       rerun   : gh run rerun --failed           (+ hidden rerun-marker, capped)
+       undraft : gh pr ready  (triggers Copilot's automated review)
+       ready   : Teams "ready for review" card    (+ hidden ready-marker = re-arm anchor)
 ```
 
 ## The three Copilot identities

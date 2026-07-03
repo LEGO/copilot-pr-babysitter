@@ -39,6 +39,9 @@ function postComment(number, body, as) {
 function rerunFailed(runId, as) {
   return gh(['run', 'rerun', String(runId), '--repo', `${owner}/${repo}`, '--failed'], as);
 }
+function markReady(number, as) {
+  return gh(['pr', 'ready', String(number), '--repo', `${owner}/${repo}`], as);
+}
 
 async function notifyTeams(title, facts, link) {
   if (!TEAMS_WEBHOOK_URL) { console.log('::warning::TEAMS_WEBHOOK_URL unset, skipping Teams'); return; }
@@ -74,7 +77,7 @@ if (!dryRun && decisions.some((d) => d.action === 'ping')) {
 }
 
 const errors = [];
-let pinged = 0, reran = 0, ready = 0, skipped = 0;
+let pinged = 0, reran = 0, ready = 0, undrafted = 0, skipped = 0;
 
 for (const d of decisions) {
   const tag = `#${d.prNumber}`;
@@ -99,6 +102,15 @@ for (const d of decisions) {
         reran++;
       }
 
+    } else if (d.action === 'undraft') {
+      // Mark ready for review — this triggers the Copilot automated review
+      // (Copilot does not review drafts). No marker needed: isDraft flips to
+      // false, so this branch is naturally not re-entered.
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would mark ready for review (triggers Copilot review)`); undrafted++; continue; }
+      markReady(d.prNumber, ghRead);
+      console.log(`  ${tag}: marked ready for review (Copilot review will follow)`);
+      undrafted++;
+
     } else if (d.action === 'ready') {
       const key = jiraKeyFromTitle(d.title);
       const facts = [
@@ -119,7 +131,7 @@ for (const d of decisions) {
   }
 }
 
-const summary = `${pinged} pinged, ${reran} re-run(s), ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
+const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
 console.log(`\nDone: ${summary}${dryRun ? ' (DRY RUN — no mutations)' : ''}`);
 if (errors.length > 0 && !dryRun) {
   await notifyTeams('⚠️ PR babysitter completed with errors', errors.map((e) => ({ title: 'error', value: e })), null).catch(() => {});

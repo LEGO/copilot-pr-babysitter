@@ -232,23 +232,28 @@ for (const pr of prs) {
       continue;
     }
 
-    // (4) Terminal candidate: idle, no open reviewer threads, CI green.
-    // But "no open threads" is vacuously true before the reviewer has even run.
-    // Only declare ready if the Copilot reviewer has actually reviewed the
-    // CURRENT head — a review from it that post-dates the last work_finished —
-    // and the PR is out of draft. Otherwise the review is still pending: skip
-    // and wait (Copilot auto-requests its own review when it finishes work).
+    // (4) Terminal region: idle, no open reviewer threads, CI green.
+    // Copilot only reviews a PR once it is marked ready for review (it does NOT
+    // review drafts). So the babysitter itself un-drafts to TRIGGER the review;
+    // the human-facing Teams post waits until that review comes back clean.
+    if (isDraft) {
+      console.log('  CI green + idle, still a draft → mark ready (triggers Copilot review)');
+      decisions.push({ ...base, action: 'undraft', reason: 'CI green, agent idle — un-draft to trigger Copilot review' });
+      continue;
+    }
+
+    // Not a draft. "No open threads" is vacuously true before the reviewer runs,
+    // so only declare ready once the Copilot reviewer has reviewed the CURRENT
+    // head — a review that post-dates the last work_finished (i.e. it reviewed
+    // the code as it stands, not a pre-fix version).
     const reviewerReviews = reviews
       .filter((r) => r.author === COPILOT_REVIEWER && r.submittedAt)
       .map((r) => new Date(r.submittedAt));
     const newestReview = newestOf(reviewerReviews);
     const reviewedCurrent = newestReview && (!workFinished || newestReview >= workFinished);
 
-    if (isDraft) {
-      console.log('  clean but still a draft → skip (not yet up for review)');
-      decisions.push({ ...base, action: 'skip', reason: 'PR is a draft' });
-    } else if (!reviewedCurrent) {
-      console.log('  clean but Copilot reviewer has not reviewed current head → skip (await review)');
+    if (!reviewedCurrent) {
+      console.log('  clean but Copilot reviewer has not reviewed current head yet → skip (await review)');
       decisions.push({ ...base, action: 'skip', reason: 'awaiting Copilot review of current head' });
     } else {
       decisions.push({ ...base, action: 'ready', reason: 'CI green, Copilot review clean on current head, agent idle' });
