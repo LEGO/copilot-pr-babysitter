@@ -153,12 +153,20 @@ for (const pr of prs) {
 
     const workStarted = newestEvent(timeline, 'copilot_work_started');
     const workFinished = newestEvent(timeline, 'copilot_work_finished');
+    const reviewedAt = newestEvent(timeline, 'reviewed');
     const newestPing = newestOf(markers.filter((m) => m.kind === 'ping').map((m) => m.ts));
     const newestReady = newestOf(markers.filter((m) => m.kind === 'ready').map((m) => m.ts));
 
     // (1) Idempotency gate.
-    // Copilot is mid-flight if work_started is the latest lifecycle event.
-    const idle = !workStarted || (workFinished && workFinished >= workStarted);
+    // Copilot is mid-flight only during a CODING cycle. It fires
+    // copilot_work_started for REVIEW cycles too, but those close with a
+    // `reviewed` event and NEVER emit copilot_work_finished. So a bare
+    // work_started that is followed by a `reviewed` event is a completed review,
+    // not active coding — otherwise every reviewed PR would deadlock the gate.
+    // Idle = latest lifecycle-closing event (work_finished OR reviewed) is at or
+    // after the latest work_started.
+    const workClosed = newestOf([workFinished, reviewedAt].filter(Boolean));
+    const idle = !workStarted || (workClosed && workClosed >= workStarted);
     // We have an outstanding ping if our newest ping post-dates the newest
     // work_started (Copilot hasn't picked it up yet — the trigger-lag race).
     const pingOutstanding = newestPing && (!workStarted || newestPing > workStarted);
