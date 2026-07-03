@@ -7,20 +7,26 @@ It's the second half of an autonomous flow: [`jira-claude-triage`](https://githu
 On each run (you own the cron), for every open Copilot PR matching your title identifier:
 
 1. **Idempotency gate** — is Copilot mid-flight, or have we already pinged and it hasn't started yet? If so, hands off.
-2. **Review comments first** — unresolved threads from the Copilot reviewer → a fresh **read-only Claude session** synthesises a concrete fix instruction → **`@copilot` ping**.
+2. **Review comments first** — reviewer threads raised against the **current head** → a fresh **read-only Claude session** synthesises a concrete fix instruction → **`@copilot` ping**.
 3. **CI next** (only when the comment queue is empty) — Claude attributes each failing check: **flaky** → re-run the job (capped); **caused by the PR** → `@copilot` ping to fix.
 4. **Un-draft to trigger review** — Copilot opens PRs as drafts and **only reviews once a PR is marked ready for review**. So when a draft is idle with green CI, the babysitter marks it ready (`gh pr ready`) to trigger the Copilot review. This is programmatic — the draft is not a manual gate.
-5. **Ready for a human** — not a draft **and** the Copilot reviewer has reviewed the current head **and** no unresolved reviewer threads **and** CI green → post a **Teams "ready for review"** card and stop.
+5. **Re-request review** — Copilot does **not** auto-re-review after a fix commit. So when the current head hasn't been reviewed yet, the babysitter explicitly re-requests the Copilot review (`requestReviews` GraphQL mutation).
+6. **Ready for a human** — the Copilot reviewer has reviewed the **current head**, that review left no thread against the head, and CI is green → post a **Teams "ready for review"** card and stop.
 
 ```
 cron / manual dispatch (in YOUR workflow)
   → fetch open Copilot PRs matching <title-pattern>
-  → per PR:  idempotency gate → comments? → CI? → draft? → reviewed & clean?
-       ping    : @copilot <instruction>          (+ hidden ping-marker = race guard)
-       rerun   : gh run rerun --failed           (+ hidden rerun-marker, capped)
-       undraft : gh pr ready  (triggers Copilot's automated review)
-       ready   : Teams "ready for review" card    (+ hidden ready-marker = re-arm anchor)
+  → per PR:  idempotency gate → threads-on-head? → CI? → draft? → head reviewed?
+       ping       : @copilot <instruction>       (+ hidden ping-marker = race guard)
+       rerun      : gh run rerun --failed         (+ hidden rerun-marker, capped)
+       undraft    : gh pr ready  (triggers the first Copilot review)
+       req-review : requestReviews  (re-triggers review of the current head)
+       ready      : Teams "ready for review" card (+ hidden ready-marker = re-arm anchor)
 ```
+
+### Why commit oids, not `isResolved`
+
+Copilot **never resolves its own review threads** and does not mark them outdated, even after it fixes the comment and even after a fresh re-review. So `isResolved` is not a usable "addressed" signal. Instead the babysitter compares **commit oids**: every review and every thread records the commit it was made against. A thread raised against a commit older than the current head was superseded by a later fix and is ignored; a PR is "clean" when the reviewer has reviewed the exact current head and that review round raised no thread against it.
 
 ## The three Copilot identities
 

@@ -59,31 +59,49 @@ function getComments(number) {
   const raw = ghJson(['api', `repos/${owner}/${repo}/issues/${number}/comments`, '--paginate'], ghOpts);
   return raw.map((c) => ({ body: c.body, createdAt: c.created_at }));
 }
-// One GraphQL round-trip for everything on the PR object: draft state, reviews
-// (who reviewed + when), and inline review threads.
+// One GraphQL round-trip for everything on the PR object: head oid, draft state,
+// the PR's node id (for requestReviews), reviews (with the commit each reviewed),
+// and inline threads (with the commit each was raised against).
+//
+// Copilot NEVER resolves review threads and does not auto-re-review after a fix,
+// so isResolved is not a reliable "addressed" signal. Instead we compare commit
+// oids: a thread raised against a commit other than the current head is STALE
+// (superseded by a later fix); "clean" = the reviewer has reviewed the current
+// head and that review round left no thread against the head.
 function getReviewState(number) {
   const data = ghGraphql(`
     { repository(owner:"${owner}", name:"${repo}") { pullRequest(number:${number}) {
+      id
       isDraft
-      reviews(first:50) { nodes { author{login} state submittedAt } }
+      headRefOid
+      suggestedReviewers { reviewer { login id } }
+      reviews(first:50) { nodes { author{login} state submittedAt commit{oid} } }
       reviewThreads(first:100) { nodes {
         isResolved
-        comments(first:1){ nodes { author{login} body path } }
+        comments(first:1){ nodes { author{login} body path pullRequestReview{ commit{oid} } } }
       } } } } }`, ghOpts);
   const pr = data.repository.pullRequest;
+  const copilotSuggested = (pr.suggestedReviewers || []).find((s) => s.reviewer?.login === 'Copilot');
   return {
+    prNodeId: pr.id,
     isDraft: pr.isDraft,
-    reviews: pr.reviews.nodes.map((r) => ({ author: r.author?.login || '', state: r.state, submittedAt: r.submittedAt })),
-    threads: pr.reviewThreads.nodes.map((t) => ({
-      isResolved: t.isResolved,
-      author: t.comments.nodes[0]?.author?.login || '',
-      body: t.comments.nodes[0]?.body || '',
-      path: t.comments.nodes[0]?.path || '',
+    headOid: pr.headRefOid,
+    copilotReviewerId: copilotSuggested?.reviewer?.id || null, // requestable bot id, if offered
+    reviews: pr.reviews.nodes.map((r) => ({
+      author: r.author?.login || '', state: r.state, submittedAt: r.submittedAt,
+      commitOid: r.commit?.oid || null,
     })),
+    threads: pr.reviewThreads.nodes.map((t) => {
+      const c = t.comments.nodes[0];
+      return {
+        isResolved: t.isResolved,
+        author: c?.author?.login || '',
+        body: c?.body || '',
+        path: c?.path || '',
+        reviewCommitOid: c?.pullRequestReview?.commit?.oid || null,
+      };
+    }),
   };
-}
-function getHeadSha(number) {
-  return ghJson(['pr', 'view', String(number), '--repo', `${owner}/${repo}`, '--json', 'headRefOid'], ghOpts).headRefOid;
 }
 // CI via REST (checks:read / statuses:read) — avoids the statusCheckRollup
 // GraphQL path, which the default GITHUB_TOKEN cannot access on some repos.
@@ -180,22 +198,29 @@ for (const pr of prs) {
     if (alreadyPosted) { console.log('  already posted ready + no new work since → skip'); decisions.push({ ...base, action: 'skip', reason: 'ready already posted' }); continue; }
 
     // (2) Comments first.
-    const { isDraft, reviews, threads } = getReviewState(n);
-    const openReviewer = threads.filter((t) => !t.isResolved && t.author === COPILOT_REVIEWER);
-    const checks = getChecks(getHeadSha(n));
+    const { isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId } = getReviewState(n);
+
+    // Copilot never resolves threads and never marks them outdated, so isResolved
+    // is useless as "addressed". A thread is ACTIONABLE only if it was raised
+    // against the CURRENT head — i.e. its review's commit == headOid. A thread
+    // raised against an older commit was superseded by a later fix and is stale.
+    const actionable = threads.filter(
+      (t) => t.author === COPILOT_REVIEWER && !t.isResolved && t.reviewCommitOid === headOid,
+    );
+    const checks = getChecks(headOid);
     const failing = checks.filter((c) => c.state === 'fail');
     const pending = checks.filter((c) => c.state === 'pending');
 
-    if (openReviewer.length > 0) {
-      console.log(`  ${openReviewer.length} unresolved reviewer thread(s) → Claude synthesises fix instruction`);
+    if (actionable.length > 0) {
+      console.log(`  ${actionable.length} actionable reviewer thread(s) on current head → Claude synthesises fix instruction`);
       const task =
-        `A GitHub Copilot pull request has unresolved automated review comments. Explore the repository to understand them, then return the decision JSON with action "ping".\n\n` +
+        `A GitHub Copilot pull request has unresolved automated review comments on the current code. Explore the repository to understand them, then return the decision JSON with action "ping".\n\n` +
         `PR #${n}: ${pr.title}\n\nUnresolved review threads from ${COPILOT_REVIEWER}:\n` +
-        openReviewer.map((t, i) => `\n[${i + 1}] file: ${t.path}\n${t.body}`).join('\n') +
+        actionable.map((t, i) => `\n[${i + 1}] file: ${t.path}\n${t.body}`).join('\n') +
         `\n\nDiff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
       const out = extractJson(runClaude(task));
-      decisions.push({ ...base, action: 'ping', instruction: out.instruction, reason: out.reason || `${openReviewer.length} review thread(s)` });
-      console.log(`  → ping (${openReviewer.length} thread(s))`);
+      decisions.push({ ...base, action: 'ping', instruction: out.instruction, reason: out.reason || `${actionable.length} review thread(s)` });
+      console.log(`  → ping (${actionable.length} thread(s))`);
       continue;
     }
 
@@ -250,21 +275,31 @@ for (const pr of prs) {
       continue;
     }
 
-    // Not a draft. "No open threads" is vacuously true before the reviewer runs,
-    // so only declare ready once the Copilot reviewer has reviewed the CURRENT
-    // head — a review that post-dates the last work_finished (i.e. it reviewed
-    // the code as it stands, not a pre-fix version).
-    const reviewerReviews = reviews
-      .filter((r) => r.author === COPILOT_REVIEWER && r.submittedAt)
-      .map((r) => new Date(r.submittedAt));
-    const newestReview = newestOf(reviewerReviews);
-    const reviewedCurrent = newestReview && (!workFinished || newestReview >= workFinished);
+    // Not a draft, no actionable threads on the current head, CI green.
+    // "No actionable threads" is vacuously true before the reviewer has reviewed
+    // the current head. Copilot does NOT auto-re-review after a fix, so we must
+    // EXPLICITLY re-request its review whenever the head is not yet reviewed.
+    const reviewedCurrentHead = reviews.some((r) => r.author === COPILOT_REVIEWER && r.commitOid === headOid);
 
-    if (!reviewedCurrent) {
-      console.log('  clean but Copilot reviewer has not reviewed current head yet → skip (await review)');
-      decisions.push({ ...base, action: 'skip', reason: 'awaiting Copilot review of current head' });
+    if (!reviewedCurrentHead) {
+      // Trigger (or re-trigger) the Copilot review of the current head. Guard
+      // against re-requesting every tick: only request if our newest
+      // request-review marker predates the current head's latest work activity
+      // (i.e. we haven't already asked for THIS head).
+      const newestReqReview = newestOf(markers.filter((m) => m.kind === 'reqreview').map((m) => m.ts));
+      const reqOutstanding = newestReqReview && workClosed && newestReqReview >= workClosed;
+      if (reqOutstanding) {
+        console.log('  review of current head already requested, awaiting it → skip');
+        decisions.push({ ...base, action: 'skip', reason: 'review requested, awaiting' });
+      } else if (!copilotReviewerId) {
+        console.log('  current head not reviewed but Copilot reviewer not requestable → skip');
+        decisions.push({ ...base, action: 'skip', reason: 'copilot reviewer not requestable' });
+      } else {
+        console.log('  current head not reviewed → request Copilot review');
+        decisions.push({ ...base, action: 'request-review', prNodeId, copilotReviewerId, reason: 'trigger Copilot review of current head' });
+      }
     } else {
-      decisions.push({ ...base, action: 'ready', reason: 'CI green, Copilot review clean on current head, agent idle' });
+      decisions.push({ ...base, action: 'ready', reason: 'CI green, Copilot reviewed current head with no open threads, agent idle' });
       console.log('  → ready for review');
     }
   } catch (err) {

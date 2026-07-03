@@ -42,6 +42,15 @@ function rerunFailed(runId, as) {
 function markReady(number, as) {
   return gh(['pr', 'ready', String(number), '--repo', `${owner}/${repo}`], as);
 }
+// Trigger the Copilot automated review of the current head. The REST
+// reviewers-by-login path rejects the bot; the GraphQL requestReviews mutation
+// with the bot node id (from suggestedReviewers) is the working trigger.
+function requestReview(prNodeId, botId, as) {
+  const q = `mutation { requestReviews(input:{pullRequestId:"${prNodeId}", botIds:["${botId}"], union:true}){ pullRequest{ id } } }`;
+  const out = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`], as));
+  if (out.errors) throw new Error(`requestReviews: ${JSON.stringify(out.errors).slice(0, 200)}`);
+  return out;
+}
 
 async function notifyTeams(title, facts, link) {
   if (!TEAMS_WEBHOOK_URL) { console.log('::warning::TEAMS_WEBHOOK_URL unset, skipping Teams'); return; }
@@ -77,7 +86,7 @@ if (!dryRun && decisions.some((d) => d.action === 'ping')) {
 }
 
 const errors = [];
-let pinged = 0, reran = 0, ready = 0, undrafted = 0, skipped = 0;
+let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, skipped = 0;
 
 for (const d of decisions) {
   const tag = `#${d.prNumber}`;
@@ -114,6 +123,16 @@ for (const d of decisions) {
       console.log(`  ${tag}: marked ready for review (Copilot review will follow)`);
       undrafted++;
 
+    } else if (d.action === 'request-review') {
+      // Re-trigger the Copilot review of the current head (Copilot does not
+      // auto-re-review after a fix). Uses copilot-token; leaves a reqreview
+      // marker so we don't re-request every tick while awaiting the review.
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would request Copilot review of current head`); reviewReqd++; continue; }
+      requestReview(d.prNodeId, d.copilotReviewerId, ghCopilot);
+      postComment(d.prNumber, `${buildMarker('reqreview')}\n🔁 Requested a fresh Copilot review of the latest changes.`, ghRead);
+      console.log(`  ${tag}: requested Copilot review`);
+      reviewReqd++;
+
     } else if (d.action === 'ready') {
       const key = jiraKeyFromTitle(d.title);
       const facts = [
@@ -134,7 +153,7 @@ for (const d of decisions) {
   }
 }
 
-const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
+const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${reviewReqd} review-requested, ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
 console.log(`\nDone: ${summary}${dryRun ? ' (DRY RUN — no mutations)' : ''}`);
 if (errors.length > 0 && !dryRun) {
   await notifyTeams('⚠️ PR babysitter completed with errors', errors.map((e) => ({ title: 'error', value: e })), null).catch(() => {});
