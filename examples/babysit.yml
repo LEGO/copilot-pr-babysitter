@@ -1,0 +1,52 @@
+# Copy this file into YOUR repository at .github/workflows/babysit.yml
+#
+# The action bundles all the logic. This workflow owns the two things an action
+# cannot: the schedule (cron) and the runner. Change the cron to set how often
+# the babysitter runs — more frequent = PRs move through fix cycles faster.
+
+name: Copilot PR Babysitter
+
+on:
+  schedule:
+    # Every 30 minutes. This is the responsiveness knob — edit it freely.
+    # https://docs.github.com/actions/using-workflows/events-that-trigger-workflows#schedule
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Assess only — no pings / re-runs / Teams'
+        type: boolean
+        default: true
+
+concurrency:
+  group: babysit-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  babysit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write         # re-run failed jobs
+      pull-requests: write   # marker comments
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: LEGO/copilot-pr-babysitter@v1
+        with:
+          # --- routing ---
+          title-pattern: 'PMO-'          # your team's Jira key convention (contains-match)
+
+          # --- Copilot cloud-agent (OAuth user-to-server token) ---
+          copilot-token: ${{ secrets.COPILOT_TOKEN }}
+
+          # --- model proxy ---
+          anthropic-base-url: ${{ secrets.ANTHROPIC_BASE_URL }}
+          anthropic-auth-token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          model: your-proxy-model-id     # your proxy's model identifier
+
+          # --- optional ---
+          teams-webhook-url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          # github-token defaults to the job's GITHUB_TOKEN (needs the permissions above)
+          # On manual runs, honour the dry-run toggle; scheduled runs are live.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || 'false' }}

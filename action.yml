@@ -1,0 +1,132 @@
+name: 'Copilot PR Babysitter'
+description: >-
+  Babysits open GitHub Copilot pull requests until they are ready for human
+  review: fetches Copilot-authored PRs matching a title identifier, uses a fresh
+  read-only Claude session per PR to attribute CI failures and synthesise fix
+  instructions, pings @copilot to address review comments / real breakage,
+  re-runs flaky checks, and posts a Teams "ready for review" card once CI is
+  green and all automated reviews are resolved. Idempotent: never double-pings.
+
+inputs:
+  # --- routing ---
+  title-pattern:
+    description: >-
+      Identifier that must appear ANYWHERE in a PR title for it to be babysat
+      (e.g. "PMO-"). Regex if it contains regex metacharacters, else a plain
+      substring. Empty = babysit all Copilot-authored PRs. Not shared org-wide;
+      set it to your team's convention.
+    required: false
+    default: ''
+
+  # --- GitHub credentials ---
+  github-token:
+    description: >-
+      Token for reads, job re-runs, and marker comments. The default GITHUB_TOKEN
+      works if the job grants contents:read, actions:write, pull-requests:write.
+    required: false
+    default: ${{ github.token }}
+  copilot-token:
+    description: >-
+      OAuth user-to-server token from a Copilot-licensed account. Authors the
+      @copilot mention that wakes the coding agent. PATs may not trigger it.
+    required: true
+
+  # --- model proxy (required) ---
+  anthropic-base-url:
+    description: 'Base URL for the Anthropic-compatible model endpoint the CLI calls.'
+    required: true
+  anthropic-auth-token:
+    description: 'Bearer token for the model endpoint. Pass from a secret.'
+    required: true
+  model:
+    description: 'Model name/id passed to the Claude CLI --model flag (your proxy''s model identifier).'
+    required: true
+
+  # --- optional knobs ---
+  teams-webhook-url:
+    description: 'Power Automate / Teams incoming webhook. If empty, "ready" is logged but not posted.'
+    required: false
+    default: ''
+  max-prs:
+    description: 'Cap on PRs processed per run (blast-radius guard).'
+    required: false
+    default: '20'
+  rerun-cap:
+    description: 'Max automatic re-runs per flaky check per PR before escalating it as a real failure.'
+    required: false
+    default: '2'
+  max-turns:
+    description: 'Per-PR Claude session turn cap.'
+    required: false
+    default: '15'
+  max-diff-bytes:
+    description: 'Cap on PR diff bytes fed into the Claude prompt (truncated beyond).'
+    required: false
+    default: '60000'
+  max-log-lines:
+    description: 'Tail lines of each failing job log fed into the Claude prompt.'
+    required: false
+    default: '200'
+  dry-run:
+    description: 'When "true", assess + upload artifact only — no pings, re-runs, comments, or Teams.'
+    required: false
+    default: 'false'
+  node-version:
+    description: 'Node.js version used to run the babysitter scripts.'
+    required: false
+    default: '24'
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/setup-node@v6.4.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install Claude Code CLI
+      shell: bash
+      run: npm install -g @anthropic-ai/claude-code
+
+    - name: Fetch Copilot-authored PRs
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        TITLE_PATTERN: ${{ inputs.title-pattern }}
+        MAX_PRS: ${{ inputs.max-prs }}
+      run: node "$GITHUB_ACTION_PATH/scripts/babysit-fetch.mjs"
+
+    - name: Assess each PR (fresh read-only Claude session where work is needed)
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic-auth-token }}
+        BABYSIT_MODEL: ${{ inputs.model }}
+        BABYSIT_MAX_TURNS: ${{ inputs.max-turns }}
+        MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
+        MAX_LOG_LINES: ${{ inputs.max-log-lines }}
+        RERUN_CAP: ${{ inputs.rerun-cap }}
+      run: node "$GITHUB_ACTION_PATH/scripts/babysit-assess.mjs"
+
+    - name: Upload babysitter decisions (audit trail)
+      if: always()
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: babysit-output
+        path: |
+          prs.json
+          decisions.json
+        if-no-files-found: warn
+
+    - name: Apply decisions (ping @copilot / rerun / Teams)
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        COPILOT_TOKEN: ${{ inputs.copilot-token }}
+        TEAMS_WEBHOOK_URL: ${{ inputs.teams-webhook-url }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: node "$GITHUB_ACTION_PATH/scripts/babysit-apply.mjs"
+
+branding:
+  icon: 'eye'
+  color: 'blue'
