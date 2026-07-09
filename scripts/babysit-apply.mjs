@@ -94,6 +94,15 @@ for (const d of decisions) {
     if (d.action === 'skip') { skipped++; console.log(`  ${tag}: skip — ${d.reason}`); continue; }
 
     if (d.action === 'ping') {
+      // Hard guard: never post a ping with no instruction. A content-less
+      // "@copilot" mention tells the agent nothing and just adds noise (seen when
+      // a flaky verdict — which carries an empty instruction — reached the ping
+      // path). Assess should always supply text; if it somehow didn't, skip.
+      if (!String(d.instruction || '').trim()) {
+        console.log(`::warning::${tag}: ping decision had an empty instruction — skipping (nothing to tell @copilot)`);
+        skipped++;
+        continue;
+      }
       // Pin the work to THIS PR's branch. Left to itself, Copilot sometimes opens
       // a NEW pull request to carry the change (observed: a ping on one PR spawned
       // a separate stacked PR) instead of committing to the branch under review.

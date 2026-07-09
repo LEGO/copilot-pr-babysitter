@@ -312,12 +312,12 @@ for (const pr of prs) {
         const n2 = norm(name);
         return verdicts.find((x) => norm(x.name) === n2);
       };
-      const rerun = [], causedBy = [];
+      const rerun = [], causedBy = [], cappedFlaky = [];
       for (const c of failing) {
         const v = findVerdict(c.name);
         const verdict = v?.verdict || 'caused-by-pr'; // unknown → treat as real (safer)
         if (verdict === 'flaky') {
-          if ((rerunCounts[c.name] || 0) >= rerunCap) { causedBy.push({ ...c, note: 'flaky but rerun cap reached → escalate' }); }
+          if ((rerunCounts[c.name] || 0) >= rerunCap) { const e = { ...c, note: 'flaky but rerun cap reached → escalate' }; causedBy.push(e); cappedFlaky.push(e); }
           else rerun.push({ name: c.name, runId: c.runId });
         } else causedBy.push({ ...c });
       }
@@ -328,7 +328,15 @@ for (const pr of prs) {
       } else if (causedBy.length > 0) {
         // Real breakage (possibly alongside flakes) → ping Copilot to fix. We do
         // NOT rerun in the same tick; the fix-commit re-triggers CI anyway.
-        decisions.push({ ...base, action: 'ping', instruction: out.instruction, reason: out.reason || `${causedBy.length} PR-caused failure(s)` });
+        // A model that judged everything flaky returns an empty instruction; if the
+        // ONLY reason we are here is cap-reached flakes, synthesise a concrete
+        // escalation instruction so we never post a content-less @copilot ping.
+        let instruction = out.instruction;
+        if (!String(instruction || '').trim() && cappedFlaky.length === causedBy.length) {
+          const names = cappedFlaky.map((c) => `\`${c.name}\``).join(', ');
+          instruction = `The following CI check(s) are still failing after ${rerunCap} automatic re-run(s): ${names}. They looked flaky/infra-related, but re-running has not cleared them. Please investigate the latest failing run for each, and either fix the underlying cause on this PR's branch or flag it if the failure is genuinely outside this PR's scope.`;
+        }
+        decisions.push({ ...base, action: 'ping', instruction, reason: out.reason || `${causedBy.length} PR-caused failure(s)` });
         console.log(`  → ping (CI: ${causedBy.map((c) => c.name).join(', ')})`);
       } else {
         decisions.push({ ...base, action: 'skip', reason: 'no actionable CI verdict' });
