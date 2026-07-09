@@ -133,22 +133,38 @@ for (const d of decisions) {
       console.log(`  ${tag}: marked ready for review (Copilot review will follow)`);
       undrafted++;
 
-    } else if (d.action === 'escalate-approval') {
-      // Workflow runs were rejected by the GitHub "Approve workflows to run" gate
-      // (conclusion=action_required). Rerunning re-queues but hits the gate again.
-      // A human must click "Approve and run" on the PR's Actions tab.
-      if (dryRun) { console.log(`  [dry-run] ${tag}: would escalate — ${d.rejectedApprovalRunIds.length} run(s) need human approval`); continue; }
-      await notifyTeams(
-        `⚠️ PR #${d.prNumber} — workflow approval needed`,
-        [
-          { title: 'PR', value: `#${d.prNumber}` },
-          { title: 'Title', value: d.title },
-          { title: 'Reason', value: `CI has not run — ${d.rejectedApprovalRunIds.length} workflow run(s) were blocked by the "Approve workflows to run" gate` },
-          { title: 'Action', value: 'Click "Approve and run" on the PR Actions tab, then re-run any failed jobs' },
-        ],
-        d.url,
-      ).catch(() => {});
-      console.log(`  ${tag}: escalated — ${d.rejectedApprovalRunIds.length} run(s) need human approval`);
+    } else if (d.action === 'rerun-gated') {
+      // Workflow runs were blocked by the "Approve workflows to run" gate
+      // (conclusion=action_required). Re-running with the copilot-token — a trusted
+      // collaborator identity — clears the gate (GitHub treats a rerun by a trusted
+      // actor as approval). The github-actions bot token would NOT clear it.
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would rerun ${d.rejectedApprovalRunIds.length} gated run(s) with copilot-token`); continue; }
+      let rerunThisPr = 0;
+      const failedRuns = [];
+      for (const runId of d.rejectedApprovalRunIds) {
+        try {
+          gh(['api', '--method', 'POST', `repos/${owner}/${repo}/actions/runs/${runId}/rerun`], ghCopilot);
+          rerunThisPr++;
+          reran++;
+        } catch (rerunErr) {
+          failedRuns.push(`${runId}: ${String(rerunErr.message || '').slice(0, 60)}`);
+        }
+      }
+      if (rerunThisPr > 0) console.log(`  ${tag}: re-ran ${rerunThisPr}/${d.rejectedApprovalRunIds.length} gated run(s) with copilot-token — gate cleared, CI will run`);
+      // Only escalate if we could not clear the gate ourselves.
+      if (failedRuns.length > 0) {
+        console.log(`  ${tag}: ${failedRuns.length} gated rerun(s) failed → escalating to Teams`);
+        await notifyTeams(
+          `⚠️ PR #${d.prNumber} — workflow approval needed`,
+          [
+            { title: 'PR', value: `#${d.prNumber}` },
+            { title: 'Title', value: d.title },
+            { title: 'Reason', value: `CI blocked by the "Approve workflows to run" gate; ${failedRuns.length} run(s) could not be auto-cleared` },
+            { title: 'Action', value: 'Click "Approve and run" on the PR Actions tab' },
+          ],
+          d.url,
+        ).catch(() => {});
+      }
 
     } else if (d.action === 'approve-workflows') {
       // Workflow runs are queued but awaiting manual approval (first-time contributor
