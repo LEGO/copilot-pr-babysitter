@@ -318,7 +318,9 @@ for (const pr of prs) {
       console.log('  → ready for review');
     }
   } catch (err) {
-    const msg = (err.stderr || err.message || String(err)).toString().slice(0, 400);
+    const stderr = (err.stderr || '').toString().slice(0, 600);
+    const msg = (err.message || String(err)).toString().slice(0, 400);
+    if (stderr) console.error(`::warning::#${n}: assess stderr: ${stderr}`);
     console.error(`::warning::#${n}: assess failed: ${msg}`);
     decisions.push({ ...base, action: 'skip', reason: `assess error: ${msg}` });
   }

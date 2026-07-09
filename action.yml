@@ -85,7 +85,10 @@ runs:
 
     - name: Install Claude Code CLI
       shell: bash
-      run: npm install -g @anthropic-ai/claude-code
+      run: |
+        npm install -g @anthropic-ai/claude-code --foreground-scripts
+        echo "claude path: $(which claude || echo NOT FOUND)"
+        claude --version || true
 
     - name: Fetch Copilot-authored PRs
       shell: bash
