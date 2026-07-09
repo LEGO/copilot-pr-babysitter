@@ -102,19 +102,37 @@ for (const d of decisions) {
 
     } else if (d.action === 'rerun') {
       if (dryRun) { console.log(`  [dry-run] ${tag}: would rerun ${d.rerun.map((r) => r.name).join(', ')} + rerun-marker(s)`); reran += d.rerun.length; continue; }
+      // Several failing checks can be SHARDS of the same workflow run (e.g.
+      // "tests - 3" and "tests - 4" share one runId). `gh run rerun --failed`
+      // re-runs every failed job in the run at once, so we invoke it once per
+      // UNIQUE runId — a second call for the same run is rejected with "already
+      // running". We still write one marker PER CHECK, because the per-check
+      // rerun cap in assess counts markers by check name.
+      const rerunOutcome = new Map(); // runId → 'ok' | 'skip' (skip = too old / not retriggerable)
       for (const r of d.rerun) {
         if (!r.runId) { console.log(`    ${tag}: no runId for ${r.name}, cannot rerun`); continue; }
-        try {
-          rerunFailed(r.runId, ghRead);
-        } catch (rerunErr) {
-          // GitHub rejects reruns older than 30 days. Treat as non-retryable — skip
-          // with a warning rather than surfacing as an error every cycle.
-          if (String(rerunErr.message || rerunErr.stderr || '').includes('created over a month ago')) {
-            console.log(`  ${tag}: run ${r.runId} too old to rerun (>30 days), skipping`);
-            continue;
+        if (!rerunOutcome.has(r.runId)) {
+          try {
+            rerunFailed(r.runId, ghRead);
+            rerunOutcome.set(r.runId, 'ok');
+          } catch (rerunErr) {
+            const msg = String(rerunErr.message || rerunErr.stderr || '');
+            // GitHub rejects reruns older than 30 days. Non-retryable → skip with a
+            // warning rather than surfacing as an error every cycle.
+            if (msg.includes('created over a month ago')) {
+              console.log(`  ${tag}: run ${r.runId} too old to rerun (>30 days), skipping`);
+              rerunOutcome.set(r.runId, 'skip');
+            } else if (/already running/i.test(msg)) {
+              // The run is already re-running (we just triggered it for a sibling
+              // shard, or another actor did). Benign — the CI we wanted is underway.
+              console.log(`  ${tag}: run ${r.runId} already running, treating as re-run`);
+              rerunOutcome.set(r.runId, 'ok');
+            } else {
+              throw rerunErr;
+            }
           }
-          throw rerunErr;
         }
+        if (rerunOutcome.get(r.runId) !== 'ok') continue; // too old → no marker, matches prior behaviour
         // One marker per check so next run can count against the cap.
         postComment(d.prNumber, `${buildMarker('rerun', { check: r.name })}\n♻️ Re-ran flaky check \`${r.name}\`.`, ghRead);
         console.log(`  ${tag}: re-ran ${r.name}`);
