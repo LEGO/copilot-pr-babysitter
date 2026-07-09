@@ -74,8 +74,18 @@ const PASS_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 
 // check-runs: [{ name, status, conclusion, details_url }]
 // combined status: { statuses: [{ context, state }] }
+//
+// A single logical check (e.g. "Danger") can appear on BOTH endpoints — as a
+// modern check-run AND as a legacy commit status — and the two can disagree
+// (a green check-run alongside a stale red status whose target_url is just a PR
+// comment). GitHub's own merge box de-duplicates by name with the check-run
+// authoritative; we do the same. Otherwise a stale legacy status surfaces as a
+// phantom failing check with no runId → no log → the assess prompt defaults it
+// to caused-by-pr and pings Copilot to "fix" an already-green check. Legacy
+// statuses with NO matching check-run are still kept (the reason we read both).
 export function classifyChecks({ checkRuns = [], statuses = [] } = {}) {
   const checks = [];
+  const checkRunNames = new Set(checkRuns.map((c) => c.name));
   for (const c of checkRuns) {
     let state = 'pending';
     if (c.status === 'completed') state = FAIL_CONCLUSIONS.has(c.conclusion) ? 'fail' : PASS_CONCLUSIONS.has(c.conclusion) ? 'pass' : 'pending';
@@ -84,6 +94,7 @@ export function classifyChecks({ checkRuns = [], statuses = [] } = {}) {
     checks.push({ name: c.name, state, runId });
   }
   for (const s of statuses) {
+    if (checkRunNames.has(s.context)) continue; // check-run of the same name wins
     const state = s.state === 'success' ? 'pass' : (s.state === 'pending' || s.state === 'expected') ? 'pending' : 'fail';
     checks.push({ name: s.context, state, runId: null });
   }
