@@ -146,7 +146,7 @@ function runClaude(taskPrompt) {
     '--max-turns', maxTurns,
     '--model', BABYSIT_MODEL,
     '--output-format', 'json',
-  ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: process.env });
+  ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
   const envelope = JSON.parse(stdout);
   return envelope.result ?? envelope.text ?? '';
 }
