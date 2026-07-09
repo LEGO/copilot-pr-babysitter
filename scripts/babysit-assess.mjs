@@ -21,7 +21,7 @@
 // script gathers; the apply step performs every mutation.
 //
 // Env required: ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, BABYSIT_MODEL, GITHUB_TOKEN, GITHUB_REPOSITORY
-// Env optional: BABYSIT_MAX_TURNS (15), MAX_DIFF_BYTES (60000), MAX_LOG_LINES (200), RERUN_CAP (2)
+// Env optional: BABYSIT_MAX_TURNS (15), MAX_DIFF_BYTES (60000), MAX_LOG_LINES (200), MAX_LOG_BYTES (40000), RERUN_CAP (2)
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -38,6 +38,7 @@ const [owner, repo] = GITHUB_REPOSITORY.split('/');
 const maxTurns = process.env.BABYSIT_MAX_TURNS || '15';
 const maxDiffBytes = Number(process.env.MAX_DIFF_BYTES || '60000');
 const maxLogLines = Number(process.env.MAX_LOG_LINES || '200');
+const maxLogBytes = Number(process.env.MAX_LOG_BYTES || '40000');
 const rerunCap = Number(process.env.RERUN_CAP || '2');
 const ghOpts = { token: GITHUB_TOKEN };
 
@@ -133,7 +134,12 @@ function getFailingLog(runId) {
   try {
     const log = gh(['run', 'view', runId, '--repo', `${owner}/${repo}`, '--log-failed'], ghOpts);
     const lines = log.split('\n');
-    return lines.slice(-maxLogLines).join('\n');
+    // Cap by lines first, then by bytes: MAX_LOG_LINES bounds a normal log, but a
+    // job emitting very long lines (minified bundles, base64) can still blow the
+    // prompt past what stdin/context should carry. Keep the TAIL of both.
+    let tail = lines.slice(-maxLogLines).join('\n');
+    if (tail.length > maxLogBytes) tail = `… [log head truncated to last ${maxLogBytes} bytes] …\n` + tail.slice(-maxLogBytes);
+    return tail;
   } catch (e) {
     return `(could not fetch log for run ${runId}: ${String(e.message).slice(0, 120)})`;
   }
@@ -146,15 +152,21 @@ function newestEvent(timeline, event) {
 }
 
 // ---- Claude session (read-only reasoning) ----
+// The task prompt is piped via STDIN, not passed as an argv element. It embeds
+// CI log tails + the PR diff, which for a large PR exceeds the Linux per-string
+// argv limit (MAX_ARG_STRLEN, 128 KiB) and the kernel rejects the spawn with
+// E2BIG — independent of the ~2 MB total ARG_MAX. `claude -p` with no positional
+// prompt reads the prompt from stdin, so stdin bypasses the limit entirely. Only
+// L1 (the small system prompt) stays in argv.
 function runClaude(taskPrompt) {
   const stdout = execFileSync('claude', [
-    '-p', taskPrompt,
+    '-p',
     '--append-system-prompt', L1,
     '--allowedTools', 'Read', 'Grep', 'Glob',
     '--max-turns', maxTurns,
     '--model', BABYSIT_MODEL,
     '--output-format', 'json',
-  ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  ], { input: taskPrompt, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
   const envelope = JSON.parse(stdout);
   return envelope.result ?? envelope.text ?? '';
 }
