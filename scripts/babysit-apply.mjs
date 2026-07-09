@@ -99,7 +99,7 @@ for (const d of decisions) {
       // a separate stacked PR) instead of committing to the branch under review.
       // That fragments the work and breaks the babysitter's per-PR state machine,
       // so every ping explicitly forbids it.
-      const body = `${buildMarker('ping')}\n@copilot ${d.instruction}\n\nMake these changes by committing directly to this pull request's existing branch — do NOT open a new pull request. When done, please re-request review.`;
+      const body = `${buildMarker('ping')}\n@copilot ${d.instruction}\n\nMake these changes by committing directly to this pull request's existing branch — do NOT open a new pull request.`;
       if (dryRun) { console.log(`  [dry-run] ${tag}: would @copilot ping + ping-marker\n      instruction: ${String(d.instruction).slice(0, 160)}`); pinged++; continue; }
       postComment(d.prNumber, body, ghCopilot);
       console.log(`  ${tag}: pinged @copilot`);
