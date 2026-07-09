@@ -43,6 +43,17 @@ inputs:
     required: true
 
   # --- optional knobs ---
+  policy-file:
+    description: >-
+      Path (relative to the consuming repo checkout) to a Markdown file of
+      repository-specific policy appended to the invariant babysitter prompt as
+      a "Layer 2" addendum. Use it to encode repo quirks the general action must
+      not bake in — e.g. "the Danger check is an advisory gate that greens after
+      human review, never treat it as a CI failure". It may add or narrow rules
+      only; it cannot change Claude's read-only role or the output JSON schema.
+      Empty = no repo policy.
+    required: false
+    default: ''
   teams-webhook-url:
     description: 'Power Automate / Teams incoming webhook. If empty, "ready" is logged but not posted.'
     required: false
@@ -111,6 +122,7 @@ runs:
         MAX_LOG_LINES: ${{ inputs.max-log-lines }}
         MAX_LOG_BYTES: ${{ inputs.max-log-bytes }}
         RERUN_CAP: ${{ inputs.rerun-cap }}
+        POLICY_FILE: ${{ inputs.policy-file }}
       run: node "$GITHUB_ACTION_PATH/scripts/babysit-assess.mjs"
 
     - name: Upload babysitter decisions (audit trail)

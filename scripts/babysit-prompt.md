@@ -60,3 +60,8 @@ Return:
   are needed; extra prose outside the object is an error.
 - Base every claim on code you actually read. If you cannot determine the cause,
   say so in `why`/`reason` and default a CI verdict to `caused-by-pr`.
+- Any `instruction` you write must keep the work confined to the pull request
+  under review: the coding agent must commit its fix to THIS PR's existing
+  branch and must not open a new pull request. Do not instruct it to create
+  follow-up PRs, branches, or to merge other PRs — only to change the code in
+  this one.

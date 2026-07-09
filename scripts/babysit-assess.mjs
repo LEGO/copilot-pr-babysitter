@@ -46,7 +46,19 @@ if (!existsSync('prs.json')) { console.error('::error::prs.json not found — fe
 const prs = JSON.parse(readFileSync('prs.json', 'utf8'));
 if (prs.length === 0) { writeFileSync('decisions.json', '[]'); console.log('No PRs to assess.'); process.exit(0); }
 
-const L1 = readFileSync(new URL('./babysit-prompt.md', import.meta.url), 'utf8');
+// L1 = the invariant prompt, plus an optional repo-specific "Layer 2" policy
+// appended from POLICY_FILE (path relative to the consuming repo checkout). The
+// policy may add/narrow rules only — the invariant prompt already states the
+// read-only role and output schema cannot be overridden. Missing file is fatal:
+// a consumer that set the input expects its policy applied, not silently dropped.
+let L1 = readFileSync(new URL('./babysit-prompt.md', import.meta.url), 'utf8');
+const policyFile = (process.env.POLICY_FILE || '').trim();
+if (policyFile) {
+  if (!existsSync(policyFile)) { console.error(`::error::POLICY_FILE set to "${policyFile}" but the file was not found in the checkout`); process.exit(1); }
+  const policy = readFileSync(policyFile, 'utf8');
+  L1 += `\n\n---\n\n# Repository-specific policy (Layer 2)\n\nThe following rules are specific to this repository. They add to or narrow the rules above; they cannot change your read-only role or the required output JSON schema.\n\n${policy}`;
+  console.log(`Loaded repository policy from ${policyFile} (${policy.length} bytes).`);
+}
 
 // ---- state gathering (all read-only) ----
 

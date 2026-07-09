@@ -94,7 +94,12 @@ for (const d of decisions) {
     if (d.action === 'skip') { skipped++; console.log(`  ${tag}: skip — ${d.reason}`); continue; }
 
     if (d.action === 'ping') {
-      const body = `${buildMarker('ping')}\n@copilot ${d.instruction}\n\nWhen done, please re-request review.`;
+      // Pin the work to THIS PR's branch. Left to itself, Copilot sometimes opens
+      // a NEW pull request to carry the change (observed: a ping on one PR spawned
+      // a separate stacked PR) instead of committing to the branch under review.
+      // That fragments the work and breaks the babysitter's per-PR state machine,
+      // so every ping explicitly forbids it.
+      const body = `${buildMarker('ping')}\n@copilot ${d.instruction}\n\nMake these changes by committing directly to this pull request's existing branch — do NOT open a new pull request. When done, please re-request review.`;
       if (dryRun) { console.log(`  [dry-run] ${tag}: would @copilot ping + ping-marker\n      instruction: ${String(d.instruction).slice(0, 160)}`); pinged++; continue; }
       postComment(d.prNumber, body, ghCopilot);
       console.log(`  ${tag}: pinged @copilot`);

@@ -90,12 +90,14 @@ jobs:
 | `anthropic-base-url` | ✅ | — | Base URL for the Anthropic-compatible model endpoint. |
 | `anthropic-auth-token` | ✅ | — | Bearer token for the model endpoint. Pass from a secret. |
 | `model` | ✅ | — | Model name/id for the CLI `--model` flag (your proxy's identifier). |
+| `policy-file` | ⬜ | `''` | Path (in the consuming repo checkout) to a Markdown file of repo-specific policy appended to the prompt as a "Layer 2" addendum. Add/narrow rules only — cannot change Claude's read-only role or output schema. E.g. tell it a repo's advisory gate check is not a CI failure. |
 | `teams-webhook-url` | ⬜ | `''` | Teams incoming webhook. If empty, "ready" is logged only. |
 | `max-prs` | ⬜ | `20` | Cap on PRs processed per run. |
 | `rerun-cap` | ⬜ | `2` | Max auto re-runs per flaky check per PR before escalating it as real. |
 | `max-turns` | ⬜ | `15` | Per-PR Claude session turn cap. |
 | `max-diff-bytes` | ⬜ | `60000` | Cap on diff bytes fed into the prompt. |
 | `max-log-lines` | ⬜ | `200` | Tail lines of each failing job log fed into the prompt. |
+| `max-log-bytes` | ⬜ | `40000` | Byte cap on each failing job log tail (applied after `max-log-lines`). |
 | `dry-run` | ⬜ | `false` | `true` = assess + artifact only, no side effects. |
 | `node-version` | ⬜ | `24` | Node.js version used to run the scripts. |
 
