@@ -112,9 +112,17 @@ function getChecks(sha) {
   const pages = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/check-runs`, '--paginate', '--slurp'], ghOpts);
   const checkRuns = pages.flatMap((p) => p.check_runs || []);
   const approvalRuns = ghJson(['api', `repos/${owner}/${repo}/actions/runs?head_sha=${sha}&status=action_required`], ghOpts);
-  const approvalRunIds = (approvalRuns.workflow_runs || []).map((r) => r.id);
+  // GitHub returns two distinct cases under status=action_required:
+  //   - status=queued/in_progress, conclusion=null: truly pending, awaiting the human "Approve and run" click
+  //   - status=completed, conclusion=action_required: already rejected by the gate; rerun re-queues but hits the gate again
+  // Only the pending ones are approvable via POST /approve (fork-PR gate); completed ones need a human click.
+  // We surface both as approvalRunIds (the apply step handles pending via approve API, escalates on 403);
+  // we also expose rejectedApprovalRunIds so assess can escalate directly when all runs are already completed.
+  const allApprovalRuns = approvalRuns.workflow_runs || [];
+  const approvalRunIds = allApprovalRuns.filter((r) => r.status !== 'completed').map((r) => r.id);
+  const rejectedApprovalRunIds = allApprovalRuns.filter((r) => r.status === 'completed').map((r) => r.id);
   const st = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/status`], ghOpts);
-  return { checks: classifyChecks({ checkRuns, statuses: st.statuses || [] }), approvalRunIds };
+  return { checks: classifyChecks({ checkRuns, statuses: st.statuses || [] }), approvalRunIds, rejectedApprovalRunIds };
 }
 function getDiff(number) {
   const d = gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], ghOpts);
@@ -213,13 +221,20 @@ for (const pr of prs) {
     const actionable = threads.filter(
       (t) => t.author === COPILOT_REVIEWER && !t.isResolved && t.reviewCommitOid === headOid,
     );
-    const { checks, approvalRunIds } = getChecks(headOid);
+    const { checks, approvalRunIds, rejectedApprovalRunIds } = getChecks(headOid);
 
-    // If workflow runs are awaiting approval on this head, CI hasn't actually run
-    // yet — emit approve-workflows rather than treating absent checks as green.
+    // Pending approval: runs queued/in_progress but awaiting the "Approve and run" click.
+    // Attempt auto-approve (works for fork PRs); apply falls back to Teams escalation on 403.
     if (approvalRunIds.length > 0) {
       console.log(`  ${approvalRunIds.length} workflow run(s) awaiting approval → approve-workflows`);
       decisions.push({ ...base, action: 'approve-workflows', approvalRunIds, reason: `${approvalRunIds.length} run(s) pending approval` });
+      continue;
+    }
+    // Rejected by gate: runs already completed with conclusion=action_required.
+    // Rerun re-queues but hits the gate again — a human must click "Approve and run" in the UI.
+    if (rejectedApprovalRunIds.length > 0) {
+      console.log(`  ${rejectedApprovalRunIds.length} workflow run(s) rejected by approval gate → escalate (needs human "Approve and run")`);
+      decisions.push({ ...base, action: 'escalate-approval', rejectedApprovalRunIds, reason: `${rejectedApprovalRunIds.length} run(s) blocked at approval gate — needs human approval` });
       continue;
     }
 

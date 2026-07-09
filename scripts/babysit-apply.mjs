@@ -133,6 +133,23 @@ for (const d of decisions) {
       console.log(`  ${tag}: marked ready for review (Copilot review will follow)`);
       undrafted++;
 
+    } else if (d.action === 'escalate-approval') {
+      // Workflow runs were rejected by the GitHub "Approve workflows to run" gate
+      // (conclusion=action_required). Rerunning re-queues but hits the gate again.
+      // A human must click "Approve and run" on the PR's Actions tab.
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would escalate — ${d.rejectedApprovalRunIds.length} run(s) need human approval`); continue; }
+      await notifyTeams(
+        `⚠️ PR #${d.prNumber} — workflow approval needed`,
+        [
+          { title: 'PR', value: `#${d.prNumber}` },
+          { title: 'Title', value: d.title },
+          { title: 'Reason', value: `CI has not run — ${d.rejectedApprovalRunIds.length} workflow run(s) were blocked by the "Approve workflows to run" gate` },
+          { title: 'Action', value: 'Click "Approve and run" on the PR Actions tab, then re-run any failed jobs' },
+        ],
+        d.url,
+      ).catch(() => {});
+      console.log(`  ${tag}: escalated — ${d.rejectedApprovalRunIds.length} run(s) need human approval`);
+
     } else if (d.action === 'approve-workflows') {
       // Workflow runs are queued but awaiting manual approval (first-time contributor
       // gate). Attempt to auto-approve each run; fall back to a Teams escalation if
