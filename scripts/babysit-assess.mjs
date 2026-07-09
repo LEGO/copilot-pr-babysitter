@@ -278,16 +278,31 @@ for (const pr of prs) {
 
       const task =
         `A GitHub Copilot pull request has failing CI checks. For EACH failing check decide whether the failure is caused by this PR's changes ("caused-by-pr") or is flaky/infra/unrelated ("flaky"). Explore the repository as needed, then return the decision JSON.\n\n` +
-        `PR #${n}: ${pr.title}\n\nFailing checks and the tail of each failing job log:\n` +
-        failing.map((c) => `\n### check: ${c.name} (rerun so far: ${rerunCounts[c.name] || 0}/${rerunCap})\n\`\`\`\n${getFailingLog(c.runId)}\n\`\`\``).join('\n') +
+        `PR #${n}: ${pr.title}\n\nFailing checks and the tail of each failing job log. Use the exact check name (the line after "check name:") verbatim as the "name" in your JSON — do not append the rerun count or any other text.\n` +
+        failing.map((c) => `\n### check name: ${c.name}\n(rerun so far: ${rerunCounts[c.name] || 0}/${rerunCap})\n\`\`\`\n${getFailingLog(c.runId)}\n\`\`\``).join('\n') +
         `\n\nDiff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
       const out = extractJson(runClaude(task));
 
       // Model returns per-check verdicts; we split into rerun vs ping and apply the cap.
       const verdicts = Array.isArray(out.checks) ? out.checks : [];
+      // Match verdict→check resiliently. Exact match is preferred, but a model may
+      // decorate the name — e.g. echo the trailing "(rerun so far: N/M)" hint — or
+      // vary whitespace/case. Fall back to comparing names with any trailing
+      // parenthetical stripped and whitespace/case normalised. We deliberately do
+      // NOT use loose startsWith/contains: in a monorepo one check name can be a
+      // prefix of another (build vs build-app) and that would cross-bind verdicts.
+      // A miss here silently defaults to caused-by-pr, turning a unanimous flaky
+      // call into an empty-instruction ping that never re-runs — the bug this fixes.
+      const norm = (s) => String(s || '').toLowerCase().replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
+      const findVerdict = (name) => {
+        const exact = verdicts.find((x) => x.name === name);
+        if (exact) return exact;
+        const n2 = norm(name);
+        return verdicts.find((x) => norm(x.name) === n2);
+      };
       const rerun = [], causedBy = [];
       for (const c of failing) {
-        const v = verdicts.find((x) => x.name === c.name);
+        const v = findVerdict(c.name);
         const verdict = v?.verdict || 'caused-by-pr'; // unknown → treat as real (safer)
         if (verdict === 'flaky') {
           if ((rerunCounts[c.name] || 0) >= rerunCap) { causedBy.push({ ...c, note: 'flaky but rerun cap reached → escalate' }); }
