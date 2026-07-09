@@ -106,9 +106,15 @@ function getReviewState(number) {
 // CI via REST (checks:read / statuses:read) — avoids the statusCheckRollup
 // GraphQL path, which the default GITHUB_TOKEN cannot access on some repos.
 function getChecks(sha) {
-  const cr = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/check-runs`, '--paginate'], ghOpts);
+  // check-runs returns an object ({total_count, check_runs:[…]}), not a top-level
+  // array. --paginate emits one object per page; --slurp wraps them in an array so
+  // we can flatMap rather than JSON.parse failing on concatenated objects.
+  const pages = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/check-runs`, '--paginate', '--slurp'], ghOpts);
+  const checkRuns = pages.flatMap((p) => p.check_runs || []);
+  const approvalRuns = ghJson(['api', `repos/${owner}/${repo}/actions/runs?head_sha=${sha}&status=action_required`], ghOpts);
+  const approvalRunIds = (approvalRuns.workflow_runs || []).map((r) => r.id);
   const st = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/status`], ghOpts);
-  return classifyChecks({ checkRuns: cr.check_runs || [], statuses: st.statuses || [] });
+  return { checks: classifyChecks({ checkRuns, statuses: st.statuses || [] }), approvalRunIds };
 }
 function getDiff(number) {
   const d = gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], ghOpts);
@@ -207,7 +213,16 @@ for (const pr of prs) {
     const actionable = threads.filter(
       (t) => t.author === COPILOT_REVIEWER && !t.isResolved && t.reviewCommitOid === headOid,
     );
-    const checks = getChecks(headOid);
+    const { checks, approvalRunIds } = getChecks(headOid);
+
+    // If workflow runs are awaiting approval on this head, CI hasn't actually run
+    // yet — emit approve-workflows rather than treating absent checks as green.
+    if (approvalRunIds.length > 0) {
+      console.log(`  ${approvalRunIds.length} workflow run(s) awaiting approval → approve-workflows`);
+      decisions.push({ ...base, action: 'approve-workflows', approvalRunIds, reason: `${approvalRunIds.length} run(s) pending approval` });
+      continue;
+    }
+
     const failing = checks.filter((c) => c.state === 'fail');
     const pending = checks.filter((c) => c.state === 'pending');
 

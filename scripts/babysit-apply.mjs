@@ -86,7 +86,7 @@ if (!dryRun && decisions.some((d) => d.action === 'ping')) {
 }
 
 const errors = [];
-let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, skipped = 0;
+let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, approved = 0, skipped = 0;
 
 for (const d of decisions) {
   const tag = `#${d.prNumber}`;
@@ -104,7 +104,17 @@ for (const d of decisions) {
       if (dryRun) { console.log(`  [dry-run] ${tag}: would rerun ${d.rerun.map((r) => r.name).join(', ')} + rerun-marker(s)`); reran += d.rerun.length; continue; }
       for (const r of d.rerun) {
         if (!r.runId) { console.log(`    ${tag}: no runId for ${r.name}, cannot rerun`); continue; }
-        rerunFailed(r.runId, ghRead);
+        try {
+          rerunFailed(r.runId, ghRead);
+        } catch (rerunErr) {
+          // GitHub rejects reruns older than 30 days. Treat as non-retryable — skip
+          // with a warning rather than surfacing as an error every cycle.
+          if (String(rerunErr.message || rerunErr.stderr || '').includes('created over a month ago')) {
+            console.log(`  ${tag}: run ${r.runId} too old to rerun (>30 days), skipping`);
+            continue;
+          }
+          throw rerunErr;
+        }
         // One marker per check so next run can count against the cap.
         postComment(d.prNumber, `${buildMarker('rerun', { check: r.name })}\n♻️ Re-ran flaky check \`${r.name}\`.`, ghRead);
         console.log(`  ${tag}: re-ran ${r.name}`);
@@ -122,6 +132,34 @@ for (const d of decisions) {
       markReady(d.prNumber, ghCopilot);
       console.log(`  ${tag}: marked ready for review (Copilot review will follow)`);
       undrafted++;
+
+    } else if (d.action === 'approve-workflows') {
+      // Workflow runs are queued but awaiting manual approval (first-time contributor
+      // gate). Attempt to auto-approve each run; fall back to a Teams escalation if
+      // the token lacks the required permission.
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would approve ${d.approvalRunIds.length} pending workflow run(s)`); continue; }
+      let approvedThisPr = 0;
+      for (const runId of d.approvalRunIds) {
+        try {
+          gh(['api', '--method', 'POST', `repos/${owner}/${repo}/actions/runs/${runId}/approve`], ghCopilot);
+          console.log(`  ${tag}: approved workflow run ${runId}`);
+          approvedThisPr++;
+          approved++;
+        } catch (approveErr) {
+          console.log(`  ${tag}: could not auto-approve run ${runId} (${String(approveErr.message || '').slice(0, 80)}) — escalating to Teams`);
+          await notifyTeams(
+            `⚠️ PR #${d.prNumber} — workflow approval needed`,
+            [
+              { title: 'PR', value: `#${d.prNumber}` },
+              { title: 'Title', value: d.title },
+              { title: 'Reason', value: 'CI has not run — workflow runs are pending manual approval' },
+              { title: 'Action', value: 'Click "Approve and run" on the PR Actions tab' },
+            ],
+            d.url,
+          ).catch(() => {});
+        }
+      }
+      if (approvedThisPr > 0) console.log(`  ${tag}: approved ${approvedThisPr}/${d.approvalRunIds.length} workflow run(s) — CI will now run`);
 
     } else if (d.action === 'request-review') {
       // Re-trigger the Copilot review of the current head (Copilot does not
@@ -153,7 +191,7 @@ for (const d of decisions) {
   }
 }
 
-const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${reviewReqd} review-requested, ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
+const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${reviewReqd} review-requested, ${approved} workflow(s) approved, ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
 console.log(`\nDone: ${summary}${dryRun ? ' (DRY RUN — no mutations)' : ''}`);
 if (errors.length > 0 && !dryRun) {
   await notifyTeams('⚠️ PR babysitter completed with errors', errors.map((e) => ({ title: 'error', value: e })), null).catch(() => {});
