@@ -75,8 +75,8 @@ const PASS_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 // check-runs: [{ name, status, conclusion, details_url }]
 // combined status: { statuses: [{ context, state }] }
 //
-// A single logical check (e.g. "Danger") can appear on BOTH endpoints — as a
-// modern check-run AND as a legacy commit status — and the two can disagree
+// A single logical check can appear on BOTH endpoints — as a modern check-run
+// AND as a legacy commit status under the same name — and the two can disagree
 // (a green check-run alongside a stale red status whose target_url is just a PR
 // comment). GitHub's own merge box de-duplicates by name with the check-run
 // authoritative; we do the same. Otherwise a stale legacy status surfaces as a
