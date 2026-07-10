@@ -267,97 +267,123 @@ for (const pr of prs) {
     const failing = checks.filter((c) => c.state === 'fail');
     const pending = checks.filter((c) => c.state === 'pending');
 
-    if (actionable.length > 0) {
-      console.log(`  ${actionable.length} actionable reviewer thread(s) on current head → Claude synthesises fix instruction`);
+    // How many times have we already re-run each failing check? (rerun cap guard)
+    const rerunCounts = {};
+    for (const m of markers.filter((m) => m.kind === 'rerun' && m.check)) rerunCounts[m.check] = (rerunCounts[m.check] || 0) + 1;
+
+    // Match a model-supplied check name to a real check name resiliently: exact
+    // first, else compare with any trailing parenthetical stripped and whitespace/
+    // case normalised (a model may echo the "(rerun so far: N/M)" hint or re-case).
+    // Deliberately NOT startsWith/contains — a prefix name (build vs build-app)
+    // would cross-bind.
+    const norm = (s) => String(s || '').toLowerCase().replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
+
+    // ---- (3) Unified judgment ----
+    // The model judges the PR against the Definition of Done (invariant prompt +
+    // any repo policy in L1) and returns ONE action: ready | ping | rerun | wait.
+    // It is invoked ONLY when there is something to judge — an actionable
+    // current-head reviewer thread, or a failing check. Everything else (pending
+    // only, draft, unreviewed head, all-green) is handled deterministically below
+    // with no model call. Deterministic seatbelts override the model's choice.
+    let readyNote = 'CI green · automated reviews resolved · agent idle';
+    if (actionable.length > 0 || failing.length > 0) {
+      console.log(`  judgment: ${actionable.length} thread(s), ${failing.length} failing check(s) → unified model call`);
       const task =
-        `A GitHub Copilot pull request has unresolved automated review comments on the current code. Explore the repository to understand them, then return the decision JSON with action "ping".\n\n` +
-        `PR #${n}: ${pr.title}\n\nUnresolved review threads from ${COPILOT_REVIEWER}:\n` +
-        actionable.map((t, i) => `\n[${i + 1}] file: ${t.path}\n${t.body}`).join('\n') +
+        `Decide the next action for this GitHub Copilot pull request against the Definition of Done in your instructions. Explore the repository as needed, then return the decision JSON.\n\n` +
+        `PR #${n}: ${pr.title}\n` +
+        (actionable.length > 0
+          ? `\nCopilot reviewer threads needing attention (raised against the current code):\n` +
+            actionable.map((t, i) => `\n[${i + 1}] file: ${t.path}\n${t.body}`).join('\n')
+          : `\n(No open reviewer threads need attention.)`) +
+        (failing.length > 0
+          ? `\n\nFailing CI checks and the tail of each failing job log. For a "rerun", use each check's exact name (the line after "check name:") verbatim in the "checks" array — do not append the rerun count or any other text.\n` +
+            failing.map((c) => `\n### check name: ${c.name}\n(rerun so far: ${rerunCounts[c.name] || 0}/${rerunCap})\n\`\`\`\n${getFailingLog(c.runId)}\n\`\`\``).join('\n')
+          : `\n\n(No failing CI checks.)`) +
         `\n\nDiff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
       const out = extractJson(runClaude(task));
-      decisions.push({ ...base, action: 'ping', instruction: out.instruction, reason: out.reason || `${actionable.length} review thread(s)` });
-      console.log(`  → ping (${actionable.length} thread(s))`);
-      continue;
-    }
 
-    // (3) CI — only reached when the comment queue is empty.
-    if (pending.length > 0) { console.log('  CI still pending, no open comments → skip (wait)'); decisions.push({ ...base, action: 'skip', reason: 'CI pending' }); continue; }
+      // Seatbelt: validate the action enum; anything unexpected → wait.
+      let action = ['ready', 'ping', 'rerun', 'wait'].includes(out.action) ? out.action : 'wait';
+      if (action !== out.action) console.log(`::warning::#${n}: model returned unknown action "${out.action}" → treating as wait`);
 
-    if (failing.length > 0) {
-      // How many times have we already re-run each failing check? (cap guard)
-      const rerunCounts = {};
-      for (const m of markers.filter((m) => m.kind === 'rerun' && m.check)) rerunCounts[m.check] = (rerunCounts[m.check] || 0) + 1;
-
-      const task =
-        `A GitHub Copilot pull request has failing CI checks. For EACH failing check decide whether the failure is caused by this PR's changes ("caused-by-pr") or is flaky/infra/unrelated ("flaky"). Explore the repository as needed, then return the decision JSON.\n\n` +
-        `PR #${n}: ${pr.title}\n\nFailing checks and the tail of each failing job log. Use the exact check name (the line after "check name:") verbatim as the "name" in your JSON — do not append the rerun count or any other text.\n` +
-        failing.map((c) => `\n### check name: ${c.name}\n(rerun so far: ${rerunCounts[c.name] || 0}/${rerunCap})\n\`\`\`\n${getFailingLog(c.runId)}\n\`\`\``).join('\n') +
-        `\n\nDiff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
-      const out = extractJson(runClaude(task));
-
-      // Model returns per-check verdicts; we split into rerun vs ping and apply the cap.
-      const verdicts = Array.isArray(out.checks) ? out.checks : [];
-      // Match verdict→check resiliently. Exact match is preferred, but a model may
-      // decorate the name — e.g. echo the trailing "(rerun so far: N/M)" hint — or
-      // vary whitespace/case. Fall back to comparing names with any trailing
-      // parenthetical stripped and whitespace/case normalised. We deliberately do
-      // NOT use loose startsWith/contains: in a monorepo one check name can be a
-      // prefix of another (build vs build-app) and that would cross-bind verdicts.
-      // A miss here silently defaults to caused-by-pr, turning a unanimous flaky
-      // call into an empty-instruction ping that never re-runs — the bug this fixes.
-      const norm = (s) => String(s || '').toLowerCase().replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
-      const findVerdict = (name) => {
-        const exact = verdicts.find((x) => x.name === name);
-        if (exact) return exact;
-        const n2 = norm(name);
-        return verdicts.find((x) => norm(x.name) === n2);
-      };
-      const rerun = [], causedBy = [], cappedFlaky = [];
-      for (const c of failing) {
-        const v = findVerdict(c.name);
-        const verdict = v?.verdict || 'caused-by-pr'; // unknown → treat as real (safer)
-        if (verdict === 'flaky') {
-          if ((rerunCounts[c.name] || 0) >= rerunCap) { const e = { ...c, note: 'flaky but rerun cap reached → escalate' }; causedBy.push(e); cappedFlaky.push(e); }
-          else rerun.push({ name: c.name, runId: c.runId });
-        } else causedBy.push({ ...c });
-      }
-
-      if (rerun.length > 0 && causedBy.length === 0) {
-        decisions.push({ ...base, action: 'rerun', rerun, reason: out.reason || `${rerun.length} flaky check(s)` });
-        console.log(`  → rerun ${rerun.map((r) => r.name).join(', ')}`);
-      } else if (causedBy.length > 0) {
-        // Real breakage (possibly alongside flakes) → ping Copilot to fix. We do
-        // NOT rerun in the same tick; the fix-commit re-triggers CI anyway.
-        // A model that judged everything flaky returns an empty instruction; if the
-        // ONLY reason we are here is cap-reached flakes, synthesise a concrete
-        // escalation instruction so we never post a content-less @copilot ping.
-        let instruction = out.instruction;
-        if (!String(instruction || '').trim() && cappedFlaky.length === causedBy.length) {
-          const names = cappedFlaky.map((c) => `\`${c.name}\``).join(', ');
-          instruction = `The following CI check(s) are still failing after ${rerunCap} automatic re-run(s): ${names}. They looked flaky/infra-related, but re-running has not cleared them. Please investigate the latest failing run for each, and either fix the underlying cause on this PR's branch or flag it if the failure is genuinely outside this PR's scope.`;
+      if (action === 'ping') {
+        // Seatbelt: never post a content-less @copilot ping. Empty → wait.
+        const instruction = String(out.instruction || '').trim();
+        if (!instruction) {
+          console.log('  → wait (model chose ping but supplied no instruction)');
+          decisions.push({ ...base, action: 'skip', reason: 'ping with empty instruction → wait' });
+        } else {
+          decisions.push({ ...base, action: 'ping', instruction, reason: out.reason || 'model: action required on this PR' });
+          console.log('  → ping');
         }
-        decisions.push({ ...base, action: 'ping', instruction, reason: out.reason || `${causedBy.length} PR-caused failure(s)` });
-        console.log(`  → ping (CI: ${causedBy.map((c) => c.name).join(', ')})`);
-      } else {
-        decisions.push({ ...base, action: 'skip', reason: 'no actionable CI verdict' });
+        continue;
       }
+
+      if (action === 'rerun') {
+        // Model judged the failing check(s) flaky. Resolve its names to real
+        // failing checks, then apply the rerun cap as a hard seatbelt. We only
+        // rerun when EVERY failing check is a named-and-under-cap flake; if any
+        // failing check is over cap or the model didn't name it, we ping instead
+        // (a fix-commit re-triggers CI) — never rerun in the same tick.
+        const named = new Set((Array.isArray(out.checks) ? out.checks : []).map(norm));
+        const toRerun = [], blocked = [];
+        for (const c of failing) {
+          if (named.has(norm(c.name)) && (rerunCounts[c.name] || 0) < rerunCap) toRerun.push({ name: c.name, runId: c.runId });
+          else blocked.push(c);
+        }
+        if (toRerun.length > 0 && blocked.length === 0) {
+          decisions.push({ ...base, action: 'rerun', rerun: toRerun, reason: out.reason || `${toRerun.length} flaky check(s)` });
+          console.log(`  → rerun ${toRerun.map((r) => r.name).join(', ')}`);
+        } else if (blocked.length > 0) {
+          const names = blocked.map((c) => `\`${c.name}\``).join(', ');
+          const instruction = `The following CI check(s) are still failing and could not be cleared by automatic re-runs (the re-run cap of ${rerunCap} was reached, or the failure was not judged transient): ${names}. Please investigate the latest failing run for each and fix the underlying cause on this PR's branch, or flag it if the failure is genuinely outside this PR's scope.`;
+          decisions.push({ ...base, action: 'ping', instruction, reason: out.reason || `${blocked.length} check(s) need attention (rerun exhausted/ineligible)` });
+          console.log(`  → ping (rerun blocked: ${blocked.map((c) => c.name).join(', ')})`);
+        } else {
+          console.log('  → wait (rerun named no known failing check)');
+          decisions.push({ ...base, action: 'skip', reason: 'rerun named no known failing check → wait' });
+        }
+        continue;
+      }
+
+      if (action === 'wait') {
+        console.log(`  → wait (${out.reason || 'not ready, nothing actionable'})`);
+        decisions.push({ ...base, action: 'skip', reason: out.reason || 'not ready, nothing actionable' });
+        continue;
+      }
+
+      // action === 'ready' (provisional). CI still in flight overrides: a PR
+      // cannot be ready while checks are pending. Otherwise fall through to the
+      // terminal region (draft / request-review / ready) carrying the model's
+      // rationale as the ready note (so a policy-exempt ready never claims "CI
+      // green" falsely in the human-facing card).
+      if (pending.length > 0) {
+        console.log('  model said ready but CI still pending → wait');
+        decisions.push({ ...base, action: 'skip', reason: 'model ready but CI pending → wait' });
+        continue;
+      }
+      readyNote = String(out.reason || 'ready per definition of done').slice(0, 240);
+    } else if (pending.length > 0) {
+      // Nothing to judge yet (no threads, no failures) but CI still running → wait.
+      console.log('  nothing actionable, CI still pending → skip (wait)');
+      decisions.push({ ...base, action: 'skip', reason: 'CI pending' });
       continue;
     }
 
-    // (4) Terminal region: idle, no open reviewer threads, CI green.
-    // Copilot only reviews a PR once it is marked ready for review (it does NOT
-    // review drafts). So the babysitter itself un-drafts to TRIGGER the review;
-    // the human-facing Teams post waits until that review comes back clean.
+    // ---- (4) Terminal region ----
+    // Reached when the model returned ready (CI not pending), OR nothing needed
+    // judging and CI is not pending (trivially ready). Copilot only reviews a PR
+    // once it is marked ready for review (it does NOT review drafts), so the
+    // babysitter itself un-drafts to TRIGGER the review; the human-facing Teams
+    // post waits until that review comes back clean.
     if (isDraft) {
-      console.log('  CI green + idle, still a draft → mark ready (triggers Copilot review)');
-      decisions.push({ ...base, action: 'undraft', reason: 'CI green, agent idle — un-draft to trigger Copilot review' });
+      console.log('  ready per DoD + idle, still a draft → mark ready (triggers Copilot review)');
+      decisions.push({ ...base, action: 'undraft', reason: 'ready per DoD, agent idle — un-draft to trigger Copilot review' });
       continue;
     }
 
-    // Not a draft, no actionable threads on the current head, CI green.
-    // "No actionable threads" is vacuously true before the reviewer has reviewed
-    // the current head. Copilot does NOT auto-re-review after a fix, so we must
-    // EXPLICITLY re-request its review whenever the head is not yet reviewed.
+    // Not a draft, ready per DoD. Copilot does NOT auto-re-review after a fix, so
+    // we must EXPLICITLY re-request its review whenever the head is not yet reviewed.
     const reviewedCurrentHead = reviews.some((r) => r.author === COPILOT_REVIEWER && r.commitOid === headOid);
 
     if (!reviewedCurrentHead) {
@@ -378,7 +404,7 @@ for (const pr of prs) {
         decisions.push({ ...base, action: 'request-review', prNodeId, copilotReviewerId, reason: 'trigger Copilot review of current head' });
       }
     } else {
-      decisions.push({ ...base, action: 'ready', reason: 'CI green, Copilot reviewed current head with no open threads, agent idle' });
+      decisions.push({ ...base, action: 'ready', reason: readyNote, readyNote });
       console.log('  → ready for review');
     }
   } catch (err) {

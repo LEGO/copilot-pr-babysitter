@@ -238,17 +238,27 @@ for (const d of decisions) {
 
     } else if (d.action === 'ready') {
       const key = jiraKeyFromTitle(d.title);
+      // readyNote is the assessor's rationale for readiness. It must be truthful:
+      // when a check is failing-but-exempt-by-policy, readiness does NOT mean
+      // "CI green", so we render the note rather than a hardcoded green claim.
+      const status = d.readyNote || 'Automated checks satisfied · Copilot review resolved · agent idle';
       const facts = [
         { title: 'PR', value: `#${d.prNumber}` },
         { title: 'Title', value: d.title },
         ...(key ? [{ title: 'Jira', value: key }] : []),
-        { title: 'Status', value: 'CI green · automated reviews resolved · agent idle' },
+        { title: 'Status', value: status },
       ];
-      if (dryRun) { console.log(`  [dry-run] ${tag}: would post Teams "ready for review" + ready-marker`); ready++; continue; }
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would post Teams "ready for review" + ready-marker (${status})`); ready++; continue; }
       await notifyTeams(`✅ PR ready for review — ${key || d.title}`, facts, d.url);
-      postComment(d.prNumber, `${buildMarker('ready')}\n✅ This PR passed automated CI and Copilot review and was flagged ready for human review.`, ghRead); // LAST
+      postComment(d.prNumber, `${buildMarker('ready')}\n✅ This PR met the definition of ready for human review: ${status}.`, ghRead); // LAST
       console.log(`  ${tag}: posted ready-for-review`);
       ready++;
+
+    } else {
+      // Unknown/unhandled action — never silently no-op. Count it as skipped and
+      // warn so a contract drift between assess and apply is visible in the run.
+      console.log(`::warning::${tag}: unrecognised action "${d.action}" → skipping`);
+      skipped++;
     }
   } catch (err) {
     console.error(`::error::${tag}: ${err.message}`);
