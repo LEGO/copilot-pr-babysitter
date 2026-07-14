@@ -26,8 +26,8 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import {
-  gh, ghJson, ghGraphql, COPILOT_AGENT, COPILOT_REVIEWER,
-  parseMarkers, buildMarker, newestOf, groupChecks, BABYSITTER_MARKER_AUTHORS,
+  gh, ghJson, ghGraphql, COPILOT_REVIEWER,
+  parseMarkers, newestOf, groupChecks, BABYSITTER_MARKER_AUTHORS,
 } from './lib.mjs';
 
 const { ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, BABYSIT_MODEL, GITHUB_TOKEN, GITHUB_REPOSITORY } = process.env;
