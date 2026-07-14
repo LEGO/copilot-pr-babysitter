@@ -148,8 +148,32 @@ for (const d of decisions) {
         && m.data?.head === d.headOid
         && BABYSITTER_MARKER_AUTHORS.has(m.author));
       const n = priorAttempts.length + 1;
-      postComment(d.prNumber, buildMarker('attempt', { data: { obstacle: d.obstacleKey, head: d.headOid, n } }), ghRead);
-      console.log(`  ${tag}: wrote attempt marker n=${n} for obstacle ${d.obstacleKey}`);
+      // Render a human-friendly obstacle description from the key PREFIX — the raw
+      // obstacleKey is an opaque identifier and would be noise in the timeline.
+      const obstacleDesc = d.obstacleKey.startsWith('thread:')
+        ? 'a review-thread comment'
+        : d.obstacleKey.startsWith('check:')
+          ? `a failing check (${d.obstacleKey.slice('check:'.length)})`
+          : 'this pull request';
+      // Marker MUST come first (parseMarkers requires no leading text), then the
+      // visible line so the comment reads as something rather than rendering blank.
+      const attemptBody = `${buildMarker('attempt', { data: { obstacle: d.obstacleKey, head: d.headOid, n } })}\n`
+        + `🔁 Babysitter: attempt ${n}/2 addressing ${obstacleDesc} on this commit. If it is still unresolved after 2 attempts, the babysitter escalates to a human via Teams instead of pinging again.`;
+      // Post via gh api (not postComment) so we get the created comment's node_id —
+      // `gh pr comment` only returns the URL. Authored by ghRead (github-actions) so
+      // assess's trusted-marker count still includes it.
+      const created = JSON.parse(gh(['api', '--method', 'POST', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`, '-f', `body=${attemptBody}`], ghRead));
+      const nodeId = created.node_id;
+      // Minimize as OUTDATED so this ledger comment collapses by default and does
+      // not clutter the PR timeline — it stays github-actions-authored so the
+      // escalate-after-N cap still counts it. Guarded: a minimize failure must not
+      // abort the ping flow or register as an error; the comment simply stays open.
+      try {
+        gh(['api', 'graphql', '-f', `query=mutation{ minimizeComment(input:{subjectId:\"${nodeId}\", classifier:OUTDATED}){ minimizedComment{ isMinimized } } }`], ghRead);
+      } catch (minErr) {
+        console.log(`::warning::${tag}: could not minimize attempt marker (${String(minErr.message || minErr).slice(0, 80)}) — it will show but is harmless`);
+      }
+      console.log(`  ${tag}: recorded attempt n=${n}/2 for obstacle ${d.obstacleKey} (minimized)`);
     } else if (d.action === 'rerun') {
       if (dryRun) { console.log(`  [dry-run] ${tag}: would rerun ${d.rerun.map((r) => r.name).join(', ')} + rerun-marker(s)`); reran += d.rerun.length; continue; }
       // Several failing checks can be SHARDS of the same workflow run (e.g.
