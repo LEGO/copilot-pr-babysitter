@@ -8,7 +8,9 @@ judgement in the actual repository — do not speculate about code you have not
 read. You have no network and no shell.
 
 Output **exactly one JSON object and nothing else** — no prose, no code fence
-around the whole object.
+around the whole object. Emit strict RFC 8259 JSON — every key and string value
+MUST be double-quoted, no trailing commas, no JavaScript-style syntax; any
+response that is not a single valid JSON object will be discarded.
 
 ## Your task — decide the next action for this PR against the Definition of Done
 

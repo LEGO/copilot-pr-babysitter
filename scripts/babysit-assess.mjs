@@ -175,6 +175,21 @@ function newestEvent(timeline, event) {
 // E2BIG — independent of the ~2 MB total ARG_MAX. `claude -p` with no positional
 // prompt reads the prompt from stdin, so stdin bypasses the limit entirely. Only
 // L1 (the small system prompt) stays in argv.
+// Structured-output contract for the decision object. Passed to `claude` via
+// --json-schema so the model MUST emit valid RFC 8259 JSON at the tool-call
+// layer — this is what stops claude-opus-4-8 (via the LEGO proxy) from emitting
+// JS-style output with unquoted keys / trailing commas that JSON.parse rejects.
+const DECISION_SCHEMA = JSON.stringify({
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['ready', 'ping', 'rerun', 'wait', 'escalate'] },
+    instruction: { type: 'string' },
+    checks: { type: 'array', items: { type: 'string' } },
+    obstacleKey: { type: 'string' },
+    reason: { type: 'string' },
+  },
+  required: ['action'],
+});
 function runClaude(taskPrompt) {
   const stdout = execFileSync('claude', [
     '-p',
@@ -183,8 +198,11 @@ function runClaude(taskPrompt) {
     '--max-turns', maxTurns,
     '--model', BABYSIT_MODEL,
     '--output-format', 'json',
+    '--json-schema', DECISION_SCHEMA,
   ], { input: taskPrompt, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
   const envelope = JSON.parse(stdout);
+  // With --json-schema the proxy MAY surface .result already parsed as an
+  // object; return it as-is (object or string) and let the call site normalise.
   return envelope.result ?? envelope.text ?? '';
 }
 // Balanced first {...}, string-aware (prompts may embed braces/quotes/newlines).
@@ -393,7 +411,23 @@ for (const pr of prs) {
       `- wait: Nothing actionable right now (CI pending, or watching something)\n` +
       `- escalate: PR needs human intervention (include "obstacleKey" field and "reason" field with human-readable explanation)\n\n` +
       `Diff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
-    const out = extractJson(runClaude(task));
+    // Three-layer parse tolerates a proxy that ignores --json-schema: prefer the
+    // already-parsed object / clean JSON string, then fall back to extracting the
+    // first balanced {...} from prose-wrapped free text.
+    const modelOut = runClaude(task);
+    let out;
+    try {
+      // Fast path: --json-schema yielded a parsed object, or a clean JSON string.
+      out = typeof modelOut === 'object' && modelOut !== null ? modelOut : JSON.parse(modelOut);
+    } catch {
+      try {
+        // Fallback: first balanced {...} in prose-wrapped free text.
+        out = extractJson(modelOut);
+      } catch (innerErr) {
+        console.error(`::debug::raw model output for #${n}: ${String(modelOut).slice(0, 2000)}`);
+        throw innerErr;
+      }
+    }
 
     // Seatbelt: validate the action enum; anything unexpected → wait.
     let action = ['ready', 'ping', 'rerun', 'wait', 'escalate'].includes(out.action) ? out.action : 'wait';
