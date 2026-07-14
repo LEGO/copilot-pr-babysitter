@@ -18,7 +18,7 @@
 // Env optional: TEAMS_WEBHOOK_URL (else ready is logged only)
 
 import { readFileSync, existsSync } from 'node:fs';
-import { gh, buildMarker, jiraKeyFromTitle } from './lib.mjs';
+import { gh, ghJson, buildMarker, parseMarkers, BABYSITTER_MARKER_AUTHORS, jiraKeyFromTitle } from './lib.mjs';
 
 const { GITHUB_TOKEN, COPILOT_TOKEN, GITHUB_REPOSITORY, TEAMS_WEBHOOK_URL, DRY_RUN } = process.env;
 const dryRun = DRY_RUN !== 'false'; // default-safe: only explicit "false" mutates
@@ -86,12 +86,35 @@ if (!dryRun && decisions.some((d) => d.action === 'ping')) {
 }
 
 const errors = [];
-let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, approved = 0, skipped = 0;
+let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, approved = 0, skipped = 0, escalated = 0;
+
+// Per-invocation cache of each PR's CURRENT head SHA, so the apply-time staleness
+// check (below) hits the API at most once per PR even when a PR carries several
+// decisions.
+const currentHeadCache = new Map(); // prNumber → current head SHA
 
 for (const d of decisions) {
   const tag = `#${d.prNumber}`;
   try {
     if (d.action === 'skip') { skipped++; console.log(`  ${tag}: skip — ${d.reason}`); continue; }
+
+    // Apply-time staleness guard. The decision was computed against d.headOid; if
+    // the branch has moved since assess ran, every side effect below would target
+    // a stale head (a ping instruction, marker, or Teams card for code that no
+    // longer exists). Skip and let the next tick re-assess the new head. Only
+    // decisions that pin a head (d.headOid present) are guarded — skip-style
+    // decisions carry none and must not be blocked.
+    if (d.headOid) {
+      if (!currentHeadCache.has(d.prNumber)) {
+        currentHeadCache.set(d.prNumber, ghJson(['api', `repos/${owner}/${repo}/pulls/${d.prNumber}`], ghRead).head.sha);
+      }
+      const currentHead = currentHeadCache.get(d.prNumber);
+      if (currentHead !== d.headOid) {
+        console.log(`  stale: ${tag} head moved ${d.headOid}->${currentHead}, re-assess next tick`);
+        skipped++;
+        continue;
+      }
+    }
 
     if (d.action === 'ping') {
       // Hard guard: never post a ping with no instruction. A content-less
@@ -113,7 +136,20 @@ for (const d of decisions) {
       postComment(d.prNumber, body, ghCopilot);
       console.log(`  ${tag}: pinged @copilot`);
       pinged++;
-
+      // Record this attempt as a marker so assess can count how many times we've
+      // pinged for THIS obstacle on THIS head (the attempt number n feeds the
+      // escalate-after-N-attempts policy). n is derived by counting prior trusted
+      // attempt markers matching the same obstacle+head, +1 for this ping.
+      const pingComments = ghJson(['api', '--paginate', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`], ghRead)
+        .map((c) => ({ body: c.body, createdAt: c.created_at, author: c.user?.login ?? null }));
+      const priorAttempts = parseMarkers(pingComments).filter((m) =>
+        m.kind === 'attempt'
+        && m.data?.obstacle === d.obstacleKey
+        && m.data?.head === d.headOid
+        && BABYSITTER_MARKER_AUTHORS.has(m.author));
+      const n = priorAttempts.length + 1;
+      postComment(d.prNumber, buildMarker('attempt', { data: { obstacle: d.obstacleKey, head: d.headOid, n } }), ghRead);
+      console.log(`  ${tag}: wrote attempt marker n=${n} for obstacle ${d.obstacleKey}`);
     } else if (d.action === 'rerun') {
       if (dryRun) { console.log(`  [dry-run] ${tag}: would rerun ${d.rerun.map((r) => r.name).join(', ')} + rerun-marker(s)`); reran += d.rerun.length; continue; }
       // Several failing checks can be SHARDS of the same workflow run (e.g.
@@ -254,8 +290,36 @@ for (const d of decisions) {
       console.log(`  ${tag}: posted ready-for-review`);
       ready++;
 
+    } else if (d.action === 'escalate') {
+      // The obstacle has resisted repeated pings on this head (assess decided we've
+      // exhausted automated attempts). Escalate to a human via Teams, then write an
+      // escalated-marker so we do NOT re-fire the card every tick while the head is
+      // unchanged.
+      const escComments = ghJson(['api', '--paginate', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`], ghRead)
+        .map((c) => ({ body: c.body, createdAt: c.created_at, author: c.user?.login ?? null }));
+      const alreadyEscalated = parseMarkers(escComments).some((m) =>
+        m.kind === 'escalated'
+        && m.data?.obstacle === d.obstacleKey
+        && m.data?.head === d.headOid
+        && BABYSITTER_MARKER_AUTHORS.has(m.author));
+      if (alreadyEscalated) { console.log(`  ${tag}: already escalated for obstacle ${d.obstacleKey} on ${d.headOid} — skipping`); skipped++; continue; }
+      if (dryRun) { console.log(`  [dry-run] ${tag}: would post Teams escalation for obstacle ${d.obstacleKey} (${d.reason || 'no reason given'}) + escalated marker`); escalated++; continue; }
+      await notifyTeams(
+        `🚨 PR #${d.prNumber} cannot reach ready — needs a human`,
+        [
+          { title: 'PR', value: `#${d.prNumber}` },
+          { title: 'Title', value: d.title },
+          { title: 'Obstacle', value: d.obstacleKey || 'unknown' },
+          { title: 'Head', value: d.headOid || 'unknown' },
+          { title: 'Reason', value: d.reason || 'no reason given' },
+        ],
+        d.url,
+      );
+      postComment(d.prNumber, buildMarker('escalated', { data: { obstacle: d.obstacleKey, head: d.headOid } }), ghRead);
+      console.log(`  ${tag}: escalated to Teams for obstacle ${d.obstacleKey}`);
+      escalated++;
+
     } else {
-      // Unknown/unhandled action — never silently no-op. Count it as skipped and
       // warn so a contract drift between assess and apply is visible in the run.
       console.log(`::warning::${tag}: unrecognised action "${d.action}" → skipping`);
       skipped++;
@@ -266,7 +330,7 @@ for (const d of decisions) {
   }
 }
 
-const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${reviewReqd} review-requested, ${approved} workflow(s) approved, ${ready} ready, ${skipped} skipped, ${errors.length} error(s)`;
+const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${reviewReqd} review-requested, ${approved} workflow(s) approved, ${ready} ready, ${escalated} escalated, ${skipped} skipped, ${errors.length} error(s)`;
 console.log(`\nDone: ${summary}${dryRun ? ' (DRY RUN — no mutations)' : ''}`);
 if (errors.length > 0 && !dryRun) {
   await notifyTeams('⚠️ PR babysitter completed with errors', errors.map((e) => ({ title: 'error', value: e })), null).catch(() => {});
