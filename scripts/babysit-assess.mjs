@@ -27,7 +27,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import {
   gh, ghJson, ghGraphql, COPILOT_AGENT, COPILOT_REVIEWER,
-  parseMarkers, newestOf, classifyChecks,
+  parseMarkers, buildMarker, newestOf, groupChecks, BABYSITTER_MARKER_AUTHORS,
 } from './lib.mjs';
 
 const { ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, BABYSIT_MODEL, GITHUB_TOKEN, GITHUB_REPOSITORY } = process.env;
@@ -70,7 +70,7 @@ function getTimeline(number) {
 }
 function getComments(number) {
   const raw = ghJson(['api', `repos/${owner}/${repo}/issues/${number}/comments`, '--paginate'], ghOpts);
-  return raw.map((c) => ({ body: c.body, createdAt: c.created_at }));
+  return raw.map((c) => ({ body: c.body, createdAt: c.created_at, author: c.user?.login || null }));
 }
 // One GraphQL round-trip for everything on the PR object: head oid, draft state,
 // the PR's node id (for requestReviews), reviews (with the commit each reviewed),
@@ -90,6 +90,7 @@ function getReviewState(number) {
       suggestedReviewers { reviewer { login id } }
       reviews(first:50) { nodes { author{login} state submittedAt commit{oid} } }
       reviewThreads(first:100) { nodes {
+        id
         isResolved
         comments(first:1){ nodes { author{login} body path pullRequestReview{ commit{oid} } } }
       } } } } }`, ghOpts);
@@ -106,12 +107,15 @@ function getReviewState(number) {
     })),
     threads: pr.reviewThreads.nodes.map((t) => {
       const c = t.comments.nodes[0];
+      const reviewCommitOid = c?.pullRequestReview?.commit?.oid || null;
       return {
+        id: t.id,
         isResolved: t.isResolved,
         author: c?.author?.login || '',
         body: c?.body || '',
         path: c?.path || '',
-        reviewCommitOid: c?.pullRequestReview?.commit?.oid || null,
+        reviewCommitOid,
+        isStale: reviewCommitOid !== null && reviewCommitOid !== pr.headRefOid,
       };
     }),
   };
@@ -135,7 +139,8 @@ function getChecks(sha) {
   const approvalRunIds = allApprovalRuns.filter((r) => r.status !== 'completed').map((r) => r.id);
   const rejectedApprovalRunIds = allApprovalRuns.filter((r) => r.status === 'completed').map((r) => r.id);
   const st = ghJson(['api', `repos/${owner}/${repo}/commits/${sha}/status`], ghOpts);
-  return { checks: classifyChecks({ checkRuns, statuses: st.statuses || [] }), approvalRunIds, rejectedApprovalRunIds };
+  const { checks, incomplete, unknownConclusions } = groupChecks({ checkRuns, statuses: st.statuses || [] });
+  return { checks, incomplete, unknownConclusions, approvalRunIds, rejectedApprovalRunIds };
 }
 function getDiff(number) {
   const d = gh(['pr', 'diff', String(number), '--repo', `${owner}/${repo}`], ghOpts);
@@ -203,9 +208,27 @@ for (const pr of prs) {
   const n = pr.number;
   console.log(`\n=== Assessing #${n}: ${pr.title} ===`);
   const base = { prNumber: n, title: pr.title, url: pr.url };
+  let gathererFailed = false;
   try {
-    const timeline = getTimeline(n);
-    const markers = parseMarkers(getComments(n));
+    let timeline;
+    try {
+      timeline = getTimeline(n);
+    } catch (e) {
+      gathererFailed = true;
+      console.log(`::warning::#${n}: getTimeline failed: ${e.message}`);
+      timeline = [];
+    }
+
+    let comments;
+    try {
+      comments = getComments(n);
+    } catch (e) {
+      gathererFailed = true;
+      console.log(`::warning::#${n}: getComments failed: ${e.message}`);
+      comments = [];
+    }
+
+    const markers = parseMarkers(comments);
 
     const workStarted = newestEvent(timeline, 'copilot_work_started');
     const workFinished = newestEvent(timeline, 'copilot_work_finished');
@@ -236,16 +259,23 @@ for (const pr of prs) {
     if (alreadyPosted) { console.log('  already posted ready + no new work since → skip'); decisions.push({ ...base, action: 'skip', reason: 'ready already posted' }); continue; }
 
     // (2) Comments first.
-    const { isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId } = getReviewState(n);
+    let isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId;
+    try {
+      ({ isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId } = getReviewState(n));
+    } catch (e) {
+      gathererFailed = true;
+      console.log(`::warning::#${n}: getReviewState failed: ${e.message}`);
+      throw e; // still fatal — we need headOid; propagate to outer catch
+    }
 
-    // Copilot never resolves threads and never marks them outdated, so isResolved
-    // is useless as "addressed". A thread is ACTIONABLE only if it was raised
-    // against the CURRENT head — i.e. its review's commit == headOid. A thread
-    // raised against an older commit was superseded by a later fix and is stale.
-    const actionable = threads.filter(
-      (t) => t.author === COPILOT_REVIEWER && !t.isResolved && t.reviewCommitOid === headOid,
-    );
-    const { checks, approvalRunIds, rejectedApprovalRunIds } = getChecks(headOid);
+    let checks, incomplete, unknownConclusions, approvalRunIds, rejectedApprovalRunIds;
+    try {
+      ({ checks, incomplete, unknownConclusions, approvalRunIds, rejectedApprovalRunIds } = getChecks(headOid));
+    } catch (e) {
+      gathererFailed = true;
+      console.log(`::warning::#${n}: getChecks failed: ${e.message}`);
+      throw e; // still fatal; propagate
+    }
 
     // Pending approval: runs queued/in_progress but awaiting the "Approve and run" click.
     // Attempt auto-approve (works for fork PRs); apply falls back to Teams escalation on 403.
@@ -264,12 +294,38 @@ for (const pr of prs) {
       continue;
     }
 
-    const failing = checks.filter((c) => c.state === 'fail');
-    const pending = checks.filter((c) => c.state === 'pending');
+    const FAIL_CONCLUSIONS_LOCAL = new Set(['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale']);
+
+    // A check is "currently failing" if its latest attempt's conclusion is failing
+    const currentlyFailing = checks.filter((c) => {
+      const latest = c.attempts[c.attempts.length - 1];
+      return latest && FAIL_CONCLUSIONS_LOCAL.has(latest.conclusion);
+    });
+    // A check is "currently pending" if its latest attempt's status is not 'completed'
+    const currentlyPending = checks.filter((c) => {
+      const latest = c.attempts[c.attempts.length - 1];
+      return latest && latest.status !== 'completed';
+    });
 
     // How many times have we already re-run each failing check? (rerun cap guard)
+    // Trusted-author markers only — a third party could otherwise fake reruns.
+    const trustedMarkers = markers.filter((m) => BABYSITTER_MARKER_AUTHORS.has(m.author));
     const rerunCounts = {};
-    for (const m of markers.filter((m) => m.kind === 'rerun' && m.check)) rerunCounts[m.check] = (rerunCounts[m.check] || 0) + 1;
+    for (const m of trustedMarkers.filter((m) => m.kind === 'rerun' && m.check)) {
+      rerunCounts[m.check] = (rerunCounts[m.check] || 0) + 1;
+    }
+
+    // Obstacle-cap ledger helpers (trusted authors only). An attempt marker is
+    // keyed by (obstacle_key, head_oid); once we hit the cap we escalate once.
+    const countAttempts = (obstacleKey, headOid2) =>
+      trustedMarkers.filter(
+        (m) => m.kind === 'attempt' && m.data?.obstacle === obstacleKey && m.data?.head === headOid2,
+      ).length;
+
+    const hasEscalated = (obstacleKey, headOid2) =>
+      trustedMarkers.some(
+        (m) => m.kind === 'escalated' && m.data?.obstacle === obstacleKey && m.data?.head === headOid2,
+      );
 
     // Match a model-supplied check name to a real check name resiliently: exact
     // first, else compare with any trailing parenthetical stripped and whitespace/
@@ -279,133 +335,174 @@ for (const pr of prs) {
     const norm = (s) => String(s || '').toLowerCase().replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
 
     // ---- (3) Unified judgment ----
-    // The model judges the PR against the Definition of Done (invariant prompt +
-    // any repo policy in L1) and returns ONE action: ready | ping | rerun | wait.
-    // It is invoked ONLY when there is something to judge — an actionable
-    // current-head reviewer thread, or a failing check. Everything else (pending
-    // only, draft, unreviewed head, all-green) is handled deterministically below
-    // with no model call. Deterministic seatbelts override the model's choice.
-    let readyNote = 'CI green · automated reviews resolved · agent idle';
-    if (actionable.length > 0 || failing.length > 0) {
-      console.log(`  judgment: ${actionable.length} thread(s), ${failing.length} failing check(s) → unified model call`);
-      const task =
-        `Decide the next action for this GitHub Copilot pull request against the Definition of Done in your instructions. Explore the repository as needed, then return the decision JSON.\n\n` +
-        `PR #${n}: ${pr.title}\n` +
-        (actionable.length > 0
-          ? `\nCopilot reviewer threads needing attention (raised against the current code):\n` +
-            actionable.map((t, i) => `\n[${i + 1}] file: ${t.path}\n${t.body}`).join('\n')
-          : `\n(No open reviewer threads need attention.)`) +
-        (failing.length > 0
-          ? `\n\nFailing CI checks and the tail of each failing job log. For a "rerun", use each check's exact name (the line after "check name:") verbatim in the "checks" array — do not append the rerun count or any other text.\n` +
-            failing.map((c) => `\n### check name: ${c.name}\n(rerun so far: ${rerunCounts[c.name] || 0}/${rerunCap})\n\`\`\`\n${getFailingLog(c.runId)}\n\`\`\``).join('\n')
-          : `\n\n(No failing CI checks.)`) +
-        `\n\nDiff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
-      const out = extractJson(runClaude(task));
+    // When idle we ALWAYS call the model (no pre-model actionable/failing gate):
+    // it judges the PR against the Definition of Done (invariant prompt + any repo
+    // policy in L1) and returns ONE action: ready | ping | rerun | wait | escalate.
+    // Deterministic seatbelts (obstacle cap, rerun cap, completeness veto) override
+    // the model's choice below.
+    const failingChecksText = currentlyFailing.length === 0
+      ? '(No currently-failing CI checks.)'
+      : `Currently-failing checks (full detail + log tail):\n` +
+        currentlyFailing.map((c) =>
+          `### check: ${c.name}\nAll attempts: ${c.attempts.map((a) => a.conclusion ?? a.status).join(' → ')}\nLatest runId: ${c.runId}\nRerun count so far: ${rerunCounts[c.name] || 0}/${rerunCap}\n\`\`\`\n${getFailingLog(c.runId)}\n\`\`\``
+        ).join('\n\n');
 
-      // Seatbelt: validate the action enum; anything unexpected → wait.
-      let action = ['ready', 'ping', 'rerun', 'wait'].includes(out.action) ? out.action : 'wait';
-      if (action !== out.action) console.log(`::warning::#${n}: model returned unknown action "${out.action}" → treating as wait`);
+    const passingChecks = checks.filter((c) => !currentlyFailing.includes(c) && !currentlyPending.includes(c));
+    const passingText = passingChecks.length === 0
+      ? '(No passing checks.)'
+      : `Passing checks (${passingChecks.length}): ${passingChecks.map((c) => c.name).join(', ')}`;
 
-      if (action === 'ping') {
-        // Seatbelt: never post a content-less @copilot ping. Empty → wait.
-        const instruction = String(out.instruction || '').trim();
-        if (!instruction) {
-          console.log('  → wait (model chose ping but supplied no instruction)');
-          decisions.push({ ...base, action: 'skip', reason: 'ping with empty instruction → wait' });
-        } else {
-          decisions.push({ ...base, action: 'ping', instruction, reason: out.reason || 'model: action required on this PR' });
-          console.log('  → ping');
+    const pendingText = currentlyPending.length === 0
+      ? ''
+      : `Pending checks (${currentlyPending.length}): ${currentlyPending.map((c) => c.name).join(', ')}\n`;
+
+    const allChecksAttempts = checks.map((c) =>
+      `${c.name}: [${c.attempts.map((a) => a.conclusion ?? a.status).join(', ')}]`
+    ).join('\n');
+
+    const task =
+      `Decide the next action for this GitHub Copilot pull request against the Definition of Done in your instructions.\n\n` +
+      `PR #${n}: ${pr.title}\nHead commit: ${headOid}\n\n` +
+      `## CI Checks\n\n${passingText}\n\n${pendingText}${failingChecksText}\n\n` +
+      `All checks (name: [attempt conclusions in order]):\n${allChecksAttempts}\n\n` +
+      `## Reviewer threads\n\n` +
+      (threads.length === 0
+        ? '(No reviewer threads.)'
+        : threads.map((t, i) =>
+            `[${i + 1}] id: ${t.id}\npath: ${t.path}\nauthor: ${t.author}\nisResolved: ${t.isResolved}\nisStale: ${t.isStale}\n${t.body}`
+          ).join('\n\n')
+      ) +
+      `\n\n## Marker/ledger history (trusted authors only)\n\n` +
+      (trustedMarkers.length === 0
+        ? '(No markers yet.)'
+        : trustedMarkers.map((m) =>
+            `${m.ts.toISOString()} [${m.kind}]${m.check ? ` check:${m.check}` : ''}${m.data ? ` data:${JSON.stringify(m.data)}` : ''}${m.author ? ` by:${m.author}` : ''}`
+          ).join('\n')
+      ) +
+      `\n\n## Approval-gate state\n\n` +
+      (approvalRunIds.length > 0
+        ? `${approvalRunIds.length} run(s) awaiting approval: ${approvalRunIds.join(', ')}`
+        : rejectedApprovalRunIds.length > 0
+          ? `${rejectedApprovalRunIds.length} run(s) rejected by gate: ${rejectedApprovalRunIds.join(', ')}`
+          : '(No approval-gate issues.)'
+      ) +
+      `\n\nYour action vocabulary: ready | ping | rerun | wait | escalate.\n` +
+      `- ready: PR meets DoD, all checks passing, no open threads on current head\n` +
+      `- ping: Send a fix instruction to the Copilot agent (include "instruction" field and "obstacleKey" field: "check:<normname>" or "thread:<id>")\n` +
+      `- rerun: Re-run flaky checks (include "checks" array with exact check names)\n` +
+      `- wait: Nothing actionable right now (CI pending, or watching something)\n` +
+      `- escalate: PR needs human intervention (include "obstacleKey" field and "reason" field with human-readable explanation)\n\n` +
+      `Diff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
+    const out = extractJson(runClaude(task));
+
+    // Seatbelt: validate the action enum; anything unexpected → wait.
+    let action = ['ready', 'ping', 'rerun', 'wait', 'escalate'].includes(out.action) ? out.action : 'wait';
+    if (action !== out.action) console.log(`::warning::#${n}: model returned unknown action "${out.action}" → treating as wait`);
+
+    if (action === 'rerun') {
+      // Model judged the failing check(s) flaky. Resolve names to real failing
+      // checks and apply the rerun cap. Over-cap or unnamed → wait (suppress-only;
+      // never fabricate a ping — the model is the sole originator of pings).
+      const named = new Set((Array.isArray(out.checks) ? out.checks : []).map(norm));
+      const toRerun = [];
+      for (const c of currentlyFailing) {
+        if (named.has(norm(c.name)) && (rerunCounts[c.name] || 0) < rerunCap) {
+          toRerun.push({ name: c.name, runId: c.runId });
         }
-        continue;
       }
-
-      if (action === 'rerun') {
-        // Model judged the failing check(s) flaky. Resolve its names to real
-        // failing checks, then apply the rerun cap as a hard seatbelt. We only
-        // rerun when EVERY failing check is a named-and-under-cap flake; if any
-        // failing check is over cap or the model didn't name it, we ping instead
-        // (a fix-commit re-triggers CI) — never rerun in the same tick.
-        const named = new Set((Array.isArray(out.checks) ? out.checks : []).map(norm));
-        const toRerun = [], blocked = [];
-        for (const c of failing) {
-          if (named.has(norm(c.name)) && (rerunCounts[c.name] || 0) < rerunCap) toRerun.push({ name: c.name, runId: c.runId });
-          else blocked.push(c);
-        }
-        if (toRerun.length > 0 && blocked.length === 0) {
-          decisions.push({ ...base, action: 'rerun', rerun: toRerun, reason: out.reason || `${toRerun.length} flaky check(s)` });
-          console.log(`  → rerun ${toRerun.map((r) => r.name).join(', ')}`);
-        } else if (blocked.length > 0) {
-          const names = blocked.map((c) => `\`${c.name}\``).join(', ');
-          const instruction = `The following CI check(s) are still failing and could not be cleared by automatic re-runs (the re-run cap of ${rerunCap} was reached, or the failure was not judged transient): ${names}. Please investigate the latest failing run for each and fix the underlying cause on this PR's branch, or flag it if the failure is genuinely outside this PR's scope.`;
-          decisions.push({ ...base, action: 'ping', instruction, reason: out.reason || `${blocked.length} check(s) need attention (rerun exhausted/ineligible)` });
-          console.log(`  → ping (rerun blocked: ${blocked.map((c) => c.name).join(', ')})`);
-        } else {
-          console.log('  → wait (rerun named no known failing check)');
-          decisions.push({ ...base, action: 'skip', reason: 'rerun named no known failing check → wait' });
-        }
-        continue;
-      }
-
-      if (action === 'wait') {
-        console.log(`  → wait (${out.reason || 'not ready, nothing actionable'})`);
-        decisions.push({ ...base, action: 'skip', reason: out.reason || 'not ready, nothing actionable' });
-        continue;
-      }
-
-      // action === 'ready' (provisional). CI still in flight overrides: a PR
-      // cannot be ready while checks are pending. Otherwise fall through to the
-      // terminal region (draft / request-review / ready) carrying the model's
-      // rationale as the ready note (so a policy-exempt ready never claims "CI
-      // green" falsely in the human-facing card).
-      if (pending.length > 0) {
-        console.log('  model said ready but CI still pending → wait');
-        decisions.push({ ...base, action: 'skip', reason: 'model ready but CI pending → wait' });
-        continue;
-      }
-      readyNote = String(out.reason || 'ready per definition of done').slice(0, 240);
-    } else if (pending.length > 0) {
-      // Nothing to judge yet (no threads, no failures) but CI still running → wait.
-      console.log('  nothing actionable, CI still pending → skip (wait)');
-      decisions.push({ ...base, action: 'skip', reason: 'CI pending' });
-      continue;
-    }
-
-    // ---- (4) Terminal region ----
-    // Reached when the model returned ready (CI not pending), OR nothing needed
-    // judging and CI is not pending (trivially ready). Copilot only reviews a PR
-    // once it is marked ready for review (it does NOT review drafts), so the
-    // babysitter itself un-drafts to TRIGGER the review; the human-facing Teams
-    // post waits until that review comes back clean.
-    if (isDraft) {
-      console.log('  ready per DoD + idle, still a draft → mark ready (triggers Copilot review)');
-      decisions.push({ ...base, action: 'undraft', reason: 'ready per DoD, agent idle — un-draft to trigger Copilot review' });
-      continue;
-    }
-
-    // Not a draft, ready per DoD. Copilot does NOT auto-re-review after a fix, so
-    // we must EXPLICITLY re-request its review whenever the head is not yet reviewed.
-    const reviewedCurrentHead = reviews.some((r) => r.author === COPILOT_REVIEWER && r.commitOid === headOid);
-
-    if (!reviewedCurrentHead) {
-      // Trigger (or re-trigger) the Copilot review of the current head. Guard
-      // against re-requesting every tick: only request if our newest
-      // request-review marker predates the current head's latest work activity
-      // (i.e. we haven't already asked for THIS head).
-      const newestReqReview = newestOf(markers.filter((m) => m.kind === 'reqreview').map((m) => m.ts));
-      const reqOutstanding = newestReqReview && workClosed && newestReqReview >= workClosed;
-      if (reqOutstanding) {
-        console.log('  review of current head already requested, awaiting it → skip');
-        decisions.push({ ...base, action: 'skip', reason: 'review requested, awaiting' });
-      } else if (!copilotReviewerId) {
-        console.log('  current head not reviewed but Copilot reviewer not requestable → skip');
-        decisions.push({ ...base, action: 'skip', reason: 'copilot reviewer not requestable' });
+      if (toRerun.length > 0) {
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'rerun', action: 'rerun', rerun: toRerun, reason: out.reason || `${toRerun.length} flaky check(s)` });
+        console.log(`  → rerun ${toRerun.map((r) => r.name).join(', ')}`);
       } else {
-        console.log('  current head not reviewed → request Copilot review');
-        decisions.push({ ...base, action: 'request-review', prNodeId, copilotReviewerId, reason: 'trigger Copilot review of current head' });
+        console.log('  → wait (rerun: no named checks under cap)');
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: 'model said rerun but no named failing check under cap → wait' });
       }
-    } else {
-      decisions.push({ ...base, action: 'ready', reason: readyNote, readyNote });
-      console.log('  → ready for review');
+      continue;
+    }
+
+    if (action === 'wait') {
+      console.log(`  → wait (${out.reason || 'not ready, nothing actionable'})`);
+      decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: out.reason || 'not ready, nothing actionable' });
+      continue;
+    }
+
+    if (action === 'ping') {
+      const instruction = String(out.instruction || '').trim();
+      if (!instruction) {
+        console.log('  → wait (model chose ping but supplied no instruction)');
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: 'ping with empty instruction → wait' });
+        continue;
+      }
+      const obstacleKey = String(out.obstacleKey || '').trim() || `pr:${n}`;
+      const attemptCount = countAttempts(obstacleKey, headOid);
+      if (attemptCount >= 2) {
+        if (hasEscalated(obstacleKey, headOid)) {
+          console.log(`  → skip (already escalated for ${obstacleKey} on ${headOid})`);
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'skip', action: 'skip', obstacleKey, reason: 'already escalated for this obstacle on this head' });
+        } else {
+          console.log(`  → escalate (obstacle cap reached: ${attemptCount} attempts for ${obstacleKey})`);
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'escalate', action: 'escalate', obstacleKey, reason: `Obstacle cap reached after ${attemptCount} attempts: ${obstacleKey} unresolved on ${headOid}` });
+        }
+      } else {
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'ping', action: 'ping', obstacleKey, instruction, reason: out.reason || 'model: action required on this PR' });
+        console.log('  → ping');
+      }
+      continue;
+    }
+
+    if (action === 'escalate') {
+      const obstacleKey = String(out.obstacleKey || '').trim() || `pr:${n}`;
+      const reason = String(out.reason || '').trim() || `PR #${n} needs human intervention`;
+      if (hasEscalated(obstacleKey, headOid)) {
+        console.log(`  → skip (already escalated for ${obstacleKey} on ${headOid})`);
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'skip', action: 'skip', obstacleKey, reason: 'already escalated for this obstacle on this head' });
+      } else {
+        console.log(`  → escalate (model-chosen: ${reason})`);
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'escalate', action: 'escalate', obstacleKey, reason });
+      }
+      continue;
+    }
+
+    if (action === 'ready') {
+      // Completeness veto: if snapshot is incomplete, downgrade ready → wait
+      if (incomplete || gathererFailed) {
+        console.log(`  completeness veto: snapshot incomplete (incomplete=${incomplete}, gathererFailed=${gathererFailed}) → wait`);
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: 'snapshot incomplete — downgrading ready to wait' });
+        continue;
+      }
+      const readyNote = String(out.reason || 'ready per definition of done').slice(0, 240);
+      // Terminal region: deterministic follow-through on a model ready. Copilot
+      // only reviews a PR once it is marked ready for review (it does NOT review
+      // drafts), so the babysitter itself un-drafts to TRIGGER the review; the
+      // human-facing Teams post waits until that review comes back clean.
+      if (isDraft) {
+        console.log('  model said ready → undraft (triggers Copilot review)');
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'undraft', action: 'undraft', reason: 'ready per DoD, agent idle — un-draft to trigger Copilot review' });
+        continue;
+      }
+      // Not a draft, ready per DoD. Copilot does NOT auto-re-review after a fix, so
+      // we must EXPLICITLY re-request its review whenever the head is not yet reviewed.
+      const reviewedCurrentHead = reviews.some((r) => r.author === COPILOT_REVIEWER && r.commitOid === headOid);
+      if (!reviewedCurrentHead) {
+        // Guard against re-requesting every tick: only request if our newest
+        // request-review marker predates the current head's latest work activity.
+        const newestReqReview = newestOf(trustedMarkers.filter((m) => m.kind === 'reqreview').map((m) => m.ts));
+        const reqOutstanding = newestReqReview && workClosed && newestReqReview >= workClosed;
+        if (reqOutstanding) {
+          console.log('  review of current head already requested, awaiting it → skip');
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'skip', action: 'skip', reason: 'review requested, awaiting' });
+        } else if (!copilotReviewerId) {
+          console.log('  current head not reviewed but Copilot reviewer not requestable → skip');
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'skip', action: 'skip', reason: 'copilot reviewer not requestable' });
+        } else {
+          console.log('  current head not reviewed → request Copilot review');
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'request-review', action: 'request-review', prNodeId, copilotReviewerId, reason: 'trigger Copilot review of current head' });
+        }
+      } else {
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'ready', action: 'ready', reason: readyNote, readyNote });
+        console.log('  → ready for review');
+      }
+      continue;
     }
   } catch (err) {
     const stderr = (err.stderr || '').toString().slice(0, 600);
