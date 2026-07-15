@@ -18,7 +18,7 @@
 // Env optional: TEAMS_WEBHOOK_URL (else ready is logged only)
 
 import { readFileSync, existsSync } from 'node:fs';
-import { gh, ghJson, buildMarker, parseMarkers, BABYSITTER_MARKER_AUTHORS, jiraKeyFromTitle } from './lib.mjs';
+import { gh, ghJson, ghGraphql, buildMarker, parseMarkers, BABYSITTER_MARKER_AUTHORS, jiraKeyFromTitle, COPILOT_REVIEWER } from './lib.mjs';
 
 const { GITHUB_TOKEN, COPILOT_TOKEN, GITHUB_REPOSITORY, TEAMS_WEBHOOK_URL, DRY_RUN } = process.env;
 const dryRun = DRY_RUN !== 'false'; // default-safe: only explicit "false" mutates
@@ -50,6 +50,63 @@ function requestReview(prNodeId, botId, as) {
   const out = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`], as));
   if (out.errors) throw new Error(`requestReviews: ${JSON.stringify(out.errors).slice(0, 200)}`);
   return out;
+}
+// Resolve a review thread the model judged wrong/unnecessary (see EDIT 1's
+// resolveThreads field). This is the ONLY place threads get resolved — assess
+// is read-only.
+function resolveReviewThread(threadId, as) {
+  const q = `mutation { resolveReviewThread(input:{threadId:"${threadId}"}){ thread{ isResolved } } }`;
+  const out = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`], as));
+  if (out.errors) throw new Error(`resolveReviewThread: ${JSON.stringify(out.errors).slice(0, 200)}`);
+  return out;
+}
+// Re-fetch the CURRENT review-thread state for the ready gate (postcondition
+// check just before posting the ready card). assess.mjs never vetoes ready on
+// threads — this is the sole enforcement point, and it must see the freshest
+// state (including any thread just resolved above in this same apply run).
+// "Live" = raised by the Copilot reviewer, not yet resolved, and not stale
+// (i.e. raised against the CURRENT head, not a since-superseded commit).
+function getLiveCopilotThreads(number) {
+  const data = ghGraphql(`
+    { repository(owner:"${owner}", name:"${repo}") { pullRequest(number:${number}) {
+      headRefOid
+      reviewThreads(first:100) { nodes {
+        id
+        isResolved
+        comments(first:1){ nodes { author{login} pullRequestReview{ commit{oid} } } }
+      } } } } }`, ghRead);
+  const pr = data.repository.pullRequest;
+  return pr.reviewThreads.nodes
+    .map((t) => {
+      const c = t.comments.nodes[0];
+      const reviewCommitOid = c?.pullRequestReview?.commit?.oid || null;
+      return {
+        id: t.id,
+        isResolved: t.isResolved,
+        author: c?.author?.login || '',
+        isStale: reviewCommitOid !== null && reviewCommitOid !== pr.headRefOid,
+      };
+    })
+    .filter((t) => t.author === COPILOT_REVIEWER && !t.isResolved && !t.isStale);
+}
+// Apply any resolveThreads the model attached to this decision (EDIT 1c/2b/2c).
+// Runs for ANY action — a decision can carry pushback on a thread even while
+// pinging or waiting on something unrelated. Each entry is independent: one
+// failing (comment or resolve mutation) must not abort the others or the rest
+// of apply — log a warning and move on.
+function applyResolveThreads(d, tag) {
+  if (!Array.isArray(d.resolveThreads) || d.resolveThreads.length === 0) return;
+  for (const rt of d.resolveThreads) {
+    const reasonText = String(rt.reason || '').trim() || 'judged unnecessary/incorrect by the babysitter';
+    if (dryRun) { console.log(`  [dry-run] ${tag}: would resolve thread ${rt.id}: ${reasonText}`); continue; }
+    try {
+      postComment(d.prNumber, `🤖 Babysitter resolved this thread: ${reasonText}`, ghRead);
+      resolveReviewThread(rt.id, ghRead);
+      console.log(`  ${tag}: resolved review thread ${rt.id} (${reasonText})`);
+    } catch (e) {
+      console.log(`::warning::${tag}: could not resolve thread ${rt.id} (${String(e.message || e).slice(0, 160)})`);
+    }
+  }
 }
 
 async function notifyTeams(title, facts, link) {
@@ -96,8 +153,6 @@ const currentHeadCache = new Map(); // prNumber → current head SHA
 for (const d of decisions) {
   const tag = `#${d.prNumber}`;
   try {
-    if (d.action === 'skip') { skipped++; console.log(`  ${tag}: skip — ${d.reason}`); continue; }
-
     // Apply-time staleness guard. The decision was computed against d.headOid; if
     // the branch has moved since assess ran, every side effect below would target
     // a stale head (a ping instruction, marker, or Teams card for code that no
@@ -115,6 +170,14 @@ for (const d of decisions) {
         continue;
       }
     }
+
+    // Resolve any model-vetted threads BEFORE the action switch, so this
+    // happens even on ping/wait decisions (wait is applied as action:'skip' —
+    // see assess.mjs) — a decision can push back on a thread while also
+    // asking for unrelated fixes, or while otherwise idle.
+    applyResolveThreads(d, tag);
+
+    if (d.action === 'skip') { skipped++; console.log(`  ${tag}: skip — ${d.reason}`); continue; }
 
     if (d.action === 'ping') {
       // Hard guard: never post a ping with no instruction. A content-less
@@ -297,6 +360,60 @@ for (const d of decisions) {
       reviewReqd++;
 
     } else if (d.action === 'ready') {
+      // POSTCONDITION READY GATE: the resolveThreads above may have just
+      // cleared threads the model judged wrong, but this is the sole,
+      // deterministic enforcement point — assess never vetoes ready on
+      // threads. Re-fetch FRESH state (not the assess-time snapshot) because
+      // a new Copilot reviewer thread can land between assess and apply, and
+      // because a resolve just above may have changed the picture. Never post
+      // the ready card while any live (unresolved, non-stale) Copilot
+      // reviewer thread remains.
+      const liveThreads = getLiveCopilotThreads(d.prNumber);
+      if (liveThreads.length > 0) {
+        const obstacleKey = `ready-block:${d.prNumber}`;
+        const blockComments = ghJson(['api', '--paginate', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`], ghRead)
+          .map((c) => ({ body: c.body, createdAt: c.created_at, author: c.user?.login ?? null }));
+        const blockMarkers = parseMarkers(blockComments);
+        const priorAttempts = blockMarkers.filter((m) =>
+          m.kind === 'attempt' && m.data?.obstacle === obstacleKey && m.data?.head === d.headOid && BABYSITTER_MARKER_AUTHORS.has(m.author));
+        const n = priorAttempts.length + 1;
+        console.log(`  ${tag}: ready blocked — ${liveThreads.length} unresolved Copilot reviewer thread(s) remain on head ${d.headOid} (attempt ${n}/2)`);
+        if (dryRun) { console.log(`  [dry-run] ${tag}: would record ready-block attempt ${n}/2`); skipped++; continue; }
+        // Same attempt-marker/minimize pattern as the ping obstacle ledger
+        // (above): a hidden ledger entry so the next tick can count attempts
+        // toward the escalate-after-N cap without cluttering the timeline.
+        const attemptBody = `${buildMarker('attempt', { data: { obstacle: obstacleKey, head: d.headOid, n } })}\n`
+          + `⏳ Babysitter: ready is blocked by ${liveThreads.length} unresolved Copilot reviewer thread(s) (attempt ${n}/2).`;
+        try {
+          const created = JSON.parse(gh(['api', '--method', 'POST', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`, '-f', `body=${attemptBody}`], ghRead));
+          gh(['api', 'graphql', '-f', `query=mutation{ minimizeComment(input:{subjectId:\"${created.node_id}\", classifier:OUTDATED}){ minimizedComment{ isMinimized } } }`], ghRead);
+        } catch (markerErr) {
+          console.log(`::warning::${tag}: could not post/minimize ready-block attempt marker (${String(markerErr.message || markerErr).slice(0, 120)})`);
+        }
+        if (n >= 2) {
+          const alreadyEscalated = blockMarkers.some((m) =>
+            m.kind === 'escalated' && m.data?.obstacle === obstacleKey && m.data?.head === d.headOid && BABYSITTER_MARKER_AUTHORS.has(m.author));
+          if (!alreadyEscalated) {
+            await notifyTeams(
+              `🚨 PR #${d.prNumber} ready blocked by unresolved reviewer threads`,
+              [
+                { title: 'PR', value: `#${d.prNumber}` },
+                { title: 'Title', value: d.title },
+                { title: 'Unresolved threads', value: String(liveThreads.length) },
+                { title: 'Head', value: d.headOid || 'unknown' },
+              ],
+              d.url,
+            ).catch(() => {});
+            postComment(d.prNumber, buildMarker('escalated', { data: { obstacle: obstacleKey, head: d.headOid } }), ghRead);
+            escalated++;
+          } else {
+            console.log(`  ${tag}: already escalated ready-block for ${obstacleKey} on ${d.headOid}`);
+          }
+        }
+        skipped++;
+        continue;
+      }
+
       const key = jiraKeyFromTitle(d.title);
       // readyNote is the assessor's rationale for readiness. It must be truthful:
       // when a check is failing-but-exempt-by-policy, readiness does NOT mean

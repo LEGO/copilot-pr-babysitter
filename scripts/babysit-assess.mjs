@@ -187,6 +187,14 @@ const DECISION_SCHEMA = JSON.stringify({
     checks: { type: 'array', items: { type: 'string' } },
     obstacleKey: { type: 'string' },
     reason: { type: 'string' },
+    resolveThreads: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { id: { type: 'string' }, reason: { type: 'string' } },
+        required: ['id'],
+      },
+    },
   },
   required: ['action'],
 });
@@ -432,6 +440,22 @@ for (const pr of prs) {
     // Seatbelt: validate the action enum; anything unexpected → wait.
     let action = ['ready', 'ping', 'rerun', 'wait', 'escalate'].includes(out.action) ? out.action : 'wait';
     if (action !== out.action) console.log(`::warning::#${n}: model returned unknown action "${out.action}" → treating as wait`);
+
+    // Sanitize model-proposed thread resolutions: only ids that match a REAL
+    // copilot-pull-request-reviewer thread we actually gathered survive — a
+    // fabricated or human-authored thread id must never be resolved on the
+    // model's say-so. Attach to `base` so every decision pushed for this PR
+    // from here on (ping/wait/escalate/ready/undraft/request-review) carries
+    // it through to decisions.json for apply to act on.
+    const copilotThreadIds = new Set(threads.filter((t) => t.author === COPILOT_REVIEWER).map((t) => t.id));
+    const resolveThreads = (Array.isArray(out.resolveThreads) ? out.resolveThreads : [])
+      .filter((rt) => {
+        const ok = rt && typeof rt.id === 'string' && copilotThreadIds.has(rt.id);
+        if (!ok) console.log(`::warning::#${n}: model proposed resolving thread "${rt?.id}" which is not a known copilot-reviewer thread → dropped`);
+        return ok;
+      })
+      .map((rt) => ({ id: rt.id, reason: String(rt.reason || '').trim() }));
+    if (resolveThreads.length > 0) base.resolveThreads = resolveThreads;
 
     if (action === 'rerun') {
       // Model judged the failing check(s) flaky. Resolve names to real failing
