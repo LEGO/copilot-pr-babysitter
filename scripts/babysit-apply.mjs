@@ -56,9 +56,27 @@ function requestReview(prNodeId, botId, as) {
 // is read-only.
 function resolveReviewThread(threadId, as) {
   const q = `mutation { resolveReviewThread(input:{threadId:"${threadId}"}){ thread{ isResolved } } }`;
-  const out = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`], as));
-  if (out.errors) throw new Error(`resolveReviewThread: ${JSON.stringify(out.errors).slice(0, 200)}`);
-  return out;
+  // Retry on transient failure: the GraphQL endpoint intermittently 5xx's or the
+  // gh CLI exits non-zero on a blip (observed on PR #58571 — the identical
+  // mutation succeeded seconds later). execFileSync THROWS on non-zero exit, so a
+  // bare call has no retry and a transient blip would leave the driving thread
+  // open (the loop-break silently doesn't happen). Two quick attempts absorb that
+  // without masking a real, persistent error, which still throws to the caller.
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const out = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`], as));
+      if (out.errors) throw new Error(`resolveReviewThread: ${JSON.stringify(out.errors).slice(0, 200)}`);
+      return out;
+    } catch (e) {
+      lastErr = e;
+      // Surface stderr, not just "Command failed: gh api graphql…" — the real
+      // GraphQL error lives there and the bare message hid the cause last time.
+      const detail = String(e.stderr || e.message || e).slice(0, 200);
+      if (attempt < 3) console.log(`::warning::resolveReviewThread ${threadId} attempt ${attempt}/3 failed (${detail}) — retrying`);
+    }
+  }
+  throw new Error(`resolveReviewThread ${threadId} failed after 3 attempts: ${String(lastErr?.stderr || lastErr?.message || lastErr).slice(0, 200)}`);
 }
 // Re-fetch the CURRENT review-thread state for the ready gate (postcondition
 // check just before posting the ready card). assess.mjs never vetoes ready on
@@ -464,7 +482,10 @@ for (const d of decisions) {
           resolveReviewThread(threadId, ghRead);
           console.log(`  ${tag}: resolved driving thread ${threadId} after update-pr`);
         } catch (e) {
-          console.log(`::warning::${tag}: could not resolve driving thread ${threadId} after update-pr (${String(e.message || e).slice(0, 140)})`);
+          // Body edit already landed; a failed resolve just leaves the thread open,
+          // so the next tick re-sees the obstacle (bounded by the attempt cap we
+          // wrote above). Surface stderr so a persistent cause is diagnosable.
+          console.log(`::warning::${tag}: could not resolve driving thread ${threadId} after update-pr (${String(e.stderr || e.message || e).slice(0, 200)})`);
         }
       }
 
