@@ -513,7 +513,15 @@ for (const d of decisions) {
               ],
               d.url,
             ).catch(() => {});
-            postComment(d.prNumber, buildMarker('escalated', { data: { obstacle: obstacleKey, head: d.headOid } }), ghRead);
+            // Marker first, then visible text (see the main escalate branch) so
+            // the PR shows why ready is blocked rather than a blank comment.
+            postComment(
+              d.prNumber,
+              `${buildMarker('escalated', { data: { obstacle: obstacleKey, head: d.headOid } })}\n`
+                + `🚨 Babysitter escalated this to a human via Teams — ready is blocked by `
+                + `${liveThreads.length} unresolved Copilot reviewer thread(s) that ${liveThreads.length === 1 ? 'has' : 'have'} not been resolved after 2 attempts.`,
+              ghRead,
+            );
             escalated++;
           } else {
             console.log(`  ${tag}: already escalated ready-block for ${obstacleKey} on ${d.headOid}`);
@@ -565,7 +573,18 @@ for (const d of decisions) {
         ],
         d.url,
       );
-      postComment(d.prNumber, buildMarker('escalated', { data: { obstacle: d.obstacleKey, head: d.headOid } }), ghRead);
+      // Marker FIRST (parseMarkers requires no leading text), then a visible line
+      // so the comment reads as an escalation on the PR rather than rendering
+      // blank — a human browsing the PR should see it was handed off and why,
+      // not just a silent Teams card they may never have seen.
+      postComment(
+        d.prNumber,
+        `${buildMarker('escalated', { data: { obstacle: d.obstacleKey, head: d.headOid } })}\n`
+          + `🚨 Babysitter escalated this to a human via Teams — it cannot reach ready automatically.\n\n`
+          + `**Obstacle:** ${d.obstacleKey || 'unknown'}\n`
+          + `**Reason:** ${d.reason || 'no reason given'}`,
+        ghRead,
+      );
       console.log(`  ${tag}: escalated to Teams for obstacle ${d.obstacleKey}`);
       escalated++;
 
