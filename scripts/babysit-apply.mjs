@@ -89,6 +89,29 @@ function getLiveCopilotThreads(number) {
     })
     .filter((t) => t.author === COPILOT_REVIEWER && !t.isResolved && !t.isStale);
 }
+// Current title/body for the update-pr optimistic-concurrency check. The model
+// decided against the assess-time snapshot; if a human edited the description in
+// the meantime we must NOT clobber their change — apply re-fetches here and
+// compares before writing.
+function getPrTitleBody(number) {
+  const data = ghGraphql(`
+    { repository(owner:"${owner}", name:"${repo}") { pullRequest(number:${number}) {
+      title
+      body
+    } } }`, ghRead);
+  const pr = data.repository.pullRequest;
+  return { title: pr.title || '', body: pr.body || '' };
+}
+// Edit the PR title and/or body. Uses GITHUB_TOKEN (the coding agent cannot do
+// this — no PR-metadata API access in its environment — which is why this action
+// exists). Only the fields provided are changed.
+function editPr(number, { title, body }, as) {
+  const args = ['pr', 'edit', String(number), '--repo', `${owner}/${repo}`];
+  if (title) args.push('--title', title);
+  if (body) args.push('--body', body);
+  return gh(args, as);
+}
+
 // Apply any resolveThreads the model attached to this decision (EDIT 1c/2b/2c).
 // Runs for ANY action — a decision can carry pushback on a thread even while
 // pinging or waiting on something unrelated. Each entry is independent: one
@@ -143,7 +166,7 @@ if (!dryRun && decisions.some((d) => d.action === 'ping')) {
 }
 
 const errors = [];
-let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, approved = 0, skipped = 0, escalated = 0;
+let pinged = 0, reran = 0, ready = 0, undrafted = 0, reviewReqd = 0, approved = 0, skipped = 0, escalated = 0, updatedPr = 0;
 
 // Per-invocation cache of each PR's CURRENT head SHA, so the apply-time staleness
 // check (below) hits the API at most once per PR even when a PR carries several
@@ -359,6 +382,92 @@ for (const d of decisions) {
       console.log(`  ${tag}: requested Copilot review`);
       reviewReqd++;
 
+    } else if (d.action === 'update-pr') {
+      // Correct the PR title/description the model judged inaccurate. The coding
+      // agent cannot edit PR metadata (no GitHub API in its sandbox), so the
+      // babysitter does it — the model produced the exact text, we apply it
+      // verbatim (same trust model as resolveThreads: model owns content, code
+      // executes).
+      //
+      // Optimistic concurrency: the model decided against the assess-time
+      // snapshot (d.currentTitle/d.currentBody). Re-fetch now; if a human edited
+      // the title/body in between, skip rather than overwrite their change — the
+      // next tick re-assesses the new state.
+      const live = getPrTitleBody(d.prNumber);
+      const titleChanged = d.newTitle && d.newTitle !== live.title;
+      const bodyChanged = d.newBody && d.newBody !== live.body;
+      if (!titleChanged && !bodyChanged) {
+        console.log(`  ${tag}: update-pr no-op (title/body already match desired) → skip`);
+        skipped++;
+        continue;
+      }
+      // Per-field staleness: only guard a field we are actually about to write.
+      // A human editing the title must not block a body-only correction (the two
+      // are independent, and we never touch a field we aren't changing).
+      if (titleChanged && d.currentTitle !== undefined && d.currentTitle !== live.title) {
+        console.log(`  ${tag}: update-pr stale — title changed since assess, re-assess next tick → skip`);
+        skipped++;
+        continue;
+      }
+      if (bodyChanged && d.currentBody !== undefined && d.currentBody !== live.body) {
+        console.log(`  ${tag}: update-pr stale — description changed since assess (human edit?), re-assess next tick → skip`);
+        skipped++;
+        continue;
+      }
+      const fields = {};
+      if (titleChanged) fields.title = d.newTitle;
+      if (bodyChanged) fields.body = d.newBody;
+      const changed = Object.keys(fields).join(' + ');
+      if (dryRun) {
+        console.log(`  [dry-run] ${tag}: would edit PR ${changed}${d.obstacleKey?.startsWith('thread:') ? ' + resolve driving thread' : ''}`);
+        updatedPr++;
+        continue;
+      }
+      editPr(d.prNumber, fields, ghRead);
+      console.log(`  ${tag}: updated PR ${changed}`);
+      updatedPr++;
+      // Record this as an attempt against the obstacle+head ledger — the SAME
+      // mechanism the ping branch uses (above) so assess's countAttempts can reach
+      // the cap and escalate. Without this the update-pr cap is dead code and a
+      // model that emits marginally different body text each tick re-edits forever
+      // (the byte-identical no-op guard above only stops exact repeats). Written
+      // BEFORE the thread-resolve so a resolve failure still counts as an attempt.
+      try {
+        const upComments = ghJson(['api', '--paginate', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`], ghRead)
+          .map((c) => ({ body: c.body, createdAt: c.created_at, author: c.user?.login ?? null }));
+        const priorAttempts = parseMarkers(upComments).filter((m) =>
+          m.kind === 'attempt'
+          && m.data?.obstacle === d.obstacleKey
+          && m.data?.head === d.headOid
+          && BABYSITTER_MARKER_AUTHORS.has(m.author));
+        const n = priorAttempts.length + 1;
+        const attemptBody = `${buildMarker('attempt', { data: { obstacle: d.obstacleKey, head: d.headOid, n } })}\n`
+          + `📝 Babysitter: attempt ${n}/2 correcting the PR ${changed} on this commit. If it is still unresolved after 2 attempts, the babysitter escalates to a human via Teams instead of editing again.`;
+        const created = JSON.parse(gh(['api', '--method', 'POST', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`, '-f', `body=${attemptBody}`], ghRead));
+        try {
+          gh(['api', 'graphql', '-f', `query=mutation{ minimizeComment(input:{subjectId:\"${created.node_id}\", classifier:OUTDATED}){ minimizedComment{ isMinimized } } }`], ghRead);
+        } catch (minErr) {
+          console.log(`::warning::${tag}: could not minimize update-pr attempt marker (${String(minErr.message || minErr).slice(0, 80)}) — it will show but is harmless`);
+        }
+        console.log(`  ${tag}: recorded update-pr attempt n=${n}/2 for obstacle ${d.obstacleKey} (minimized)`);
+      } catch (markerErr) {
+        console.log(`::warning::${tag}: could not record update-pr attempt marker (${String(markerErr.message || markerErr).slice(0, 120)}) — cap may not advance this tick`);
+      }
+      // Break the re-edit loop: if a reviewer thread drove this, resolve it now
+      // that the description is corrected. Without this the thread stays open, the
+      // next tick sees the same obstacle, and we'd edit (or ping) forever. Resolve
+      // via GITHUB_TOKEN with a note; guarded so a resolve failure doesn't abort.
+      if (d.obstacleKey?.startsWith('thread:')) {
+        const threadId = d.obstacleKey.slice('thread:'.length);
+        try {
+          postComment(d.prNumber, `🤖 Babysitter updated the PR ${changed} to address this: ${String(d.reason || '').slice(0, 200)}`, ghRead);
+          resolveReviewThread(threadId, ghRead);
+          console.log(`  ${tag}: resolved driving thread ${threadId} after update-pr`);
+        } catch (e) {
+          console.log(`::warning::${tag}: could not resolve driving thread ${threadId} after update-pr (${String(e.message || e).slice(0, 140)})`);
+        }
+      }
+
     } else if (d.action === 'ready') {
       // POSTCONDITION READY GATE: the resolveThreads above may have just
       // cleared threads the model judged wrong, but this is the sole,
@@ -471,7 +580,7 @@ for (const d of decisions) {
   }
 }
 
-const summary = `${pinged} pinged, ${reran} re-run(s), ${undrafted} un-drafted, ${reviewReqd} review-requested, ${approved} workflow(s) approved, ${ready} ready, ${escalated} escalated, ${skipped} skipped, ${errors.length} error(s)`;
+const summary = `${pinged} pinged, ${reran} re-run(s), ${updatedPr} pr-updated, ${undrafted} un-drafted, ${reviewReqd} review-requested, ${approved} workflow(s) approved, ${ready} ready, ${escalated} escalated, ${skipped} skipped, ${errors.length} error(s)`;
 console.log(`\nDone: ${summary}${dryRun ? ' (DRY RUN — no mutations)' : ''}`);
 if (errors.length > 0 && !dryRun) {
   await notifyTeams('⚠️ PR babysitter completed with errors', errors.map((e) => ({ title: 'error', value: e })), null).catch(() => {});

@@ -39,11 +39,13 @@ A PR is **ready for human review** when BOTH hold:
      the PR is not ready.
 
    A comment you happen to **agree needs no source-code edit is NOT automatically
-   satisfied**. If it asks for any real action — update the PR description, rename
-   a symbol, add a doc comment, split a change — that is a genuine request: choose
-   `ping` and instruct the coding agent to do it. "No *code* change is needed" is
-   not the same as "nothing is needed"; only push back when the comment is
-   actually **wrong or pointless**, not merely non-code.
+   satisfied**. If it asks for any real action — rename a symbol, add a doc
+   comment, split a change — that is a genuine request: choose `ping` and instruct
+   the coding agent to do it. "No *code* change is needed" is not the same as
+   "nothing is needed"; only push back when the comment is actually **wrong or
+   pointless**, not merely non-code. The one exception is a request to correct the
+   PR **title or description**: the coding agent cannot do that (see `update-pr`
+   below), so satisfy it yourself with `update-pr`, not `ping`.
 
    When you are genuinely unsure whether a comment or a check needs work, treat it
    as **actionable** (do not declare ready). A false `ready` is the most costly
@@ -59,6 +61,25 @@ Return one `action`:
   non-code — see above), or a check failing for a reason a change in this repo
   can fix. Provide an `instruction`. `ping` is the default when something is
   wrong and fixable; do not down-rank it to `wait`/`rerun` to avoid asking.
+  - **The coding agent CANNOT edit the pull request's title or description** —
+    its environment has no access to the GitHub API for PR metadata, only the
+    ability to push commits. So a request to "update the PR description", "fix
+    the title", or similar is **never pingable** — pinging it wastes attempts
+    and always ends in a needless escalation. When the only action needed is a
+    title/description correction, choose `"update-pr"` instead (see below).
+- `"update-pr"` — a reviewer thread (or the diff itself) shows the PR **title or
+  description is now inaccurate** and needs correcting, and this is something the
+  coding agent cannot do. Supply the corrected text: `newTitle` and/or `newBody`
+  (set only the field(s) that need changing; leave the other an empty string).
+  - `newBody` MUST be the **complete** replacement description: preserve every
+    part of the current body verbatim except the specific inaccuracy you are
+    fixing. You are given the current title and body below — edit them, do not
+    rewrite from scratch, and never drop sections you were not asked to touch.
+  - Set `obstacleKey` to the driving `thread:<id>` when a reviewer thread prompted
+    this, so the deterministic step can resolve that thread once the edit lands.
+  - Only choose this for genuine title/description inaccuracies. A request that
+    also needs a code change is a `ping`; a description that is already accurate
+    needs nothing.
 - `"rerun"` — choose this ONLY when you can name a **positive, transient reason**
   the check will plausibly pass on a re-run: a network timeout, runner/infra
   error, a transient dependency-fetch failure, or a genuinely flaky test. The
@@ -94,11 +115,13 @@ never `rerun` a deterministic failure to avoid an `escalate`.
 
 ```json
 {
-  "action": "ready" | "ping" | "rerun" | "wait" | "escalate",
+  "action": "ready" | "ping" | "rerun" | "wait" | "escalate" | "update-pr",
   "instruction": "For \"ping\": an imperative, self-contained instruction for the coding agent (it receives this as an @copilot comment and CANNOT see this prompt or the threads verbatim — restate what to do, name files/symbols). Empty string otherwise.",
   "checks": ["For \"rerun\": the exact names of the checks to re-run, verbatim as given. Empty otherwise."],
+  "newTitle": "For \"update-pr\": the corrected PR title, or empty string to leave the title unchanged.",
+  "newBody": "For \"update-pr\": the complete corrected PR description (preserving all current content except the fix), or empty string to leave the body unchanged.",
   "resolveThreads": [{ "id": "the reviewer thread id verbatim as given", "reason": "why this comment is wrong or unnecessary and needs no action" }],
-  "obstacleKey": "For \"ping\"/\"escalate\": a stable key for the obstacle — \"check:<check name>\" or \"thread:<thread id>\". Omit otherwise.",
+  "obstacleKey": "For \"ping\"/\"escalate\"/\"update-pr\": a stable key for the obstacle — \"check:<check name>\" or \"thread:<thread id>\". Omit otherwise.",
   "reason": "One line for the audit log: why this action."
 }
 ```

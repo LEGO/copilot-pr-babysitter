@@ -87,6 +87,8 @@ function getReviewState(number) {
       id
       isDraft
       headRefOid
+      title
+      body
       suggestedReviewers { reviewer { login id } }
       reviews(first:50) { nodes { author{login} state submittedAt commit{oid} } }
       reviewThreads(first:100) { nodes {
@@ -100,6 +102,8 @@ function getReviewState(number) {
     prNodeId: pr.id,
     isDraft: pr.isDraft,
     headOid: pr.headRefOid,
+    prTitle: pr.title || '',
+    prBody: pr.body || '',
     copilotReviewerId: copilotSuggested?.reviewer?.id || null, // requestable bot id, if offered
     reviews: pr.reviews.nodes.map((r) => ({
       author: r.author?.login || '', state: r.state, submittedAt: r.submittedAt,
@@ -182,9 +186,11 @@ function newestEvent(timeline, event) {
 const DECISION_SCHEMA = JSON.stringify({
   type: 'object',
   properties: {
-    action: { type: 'string', enum: ['ready', 'ping', 'rerun', 'wait', 'escalate'] },
+    action: { type: 'string', enum: ['ready', 'ping', 'rerun', 'wait', 'escalate', 'update-pr'] },
     instruction: { type: 'string' },
     checks: { type: 'array', items: { type: 'string' } },
+    newTitle: { type: 'string' },
+    newBody: { type: 'string' },
     obstacleKey: { type: 'string' },
     reason: { type: 'string' },
     resolveThreads: {
@@ -285,9 +291,9 @@ for (const pr of prs) {
     if (alreadyPosted) { console.log('  already posted ready + no new work since → skip'); decisions.push({ ...base, action: 'skip', reason: 'ready already posted' }); continue; }
 
     // (2) Comments first.
-    let isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId;
+    let isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId, prTitle, prBody;
     try {
-      ({ isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId } = getReviewState(n));
+      ({ isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId, prTitle, prBody } = getReviewState(n));
     } catch (e) {
       gathererFailed = true;
       console.log(`::warning::#${n}: getReviewState failed: ${e.message}`);
@@ -389,6 +395,8 @@ for (const pr of prs) {
     const task =
       `Decide the next action for this GitHub Copilot pull request against the Definition of Done in your instructions.\n\n` +
       `PR #${n}: ${pr.title}\nHead commit: ${headOid}\n\n` +
+      `## Current PR title and description (for the \"update-pr\" action)\n\n` +
+      `Current title:\n${prTitle}\n\nCurrent description:\n\`\`\`\n${prBody || '(empty)'}\n\`\`\`\n\n` +
       `## CI Checks\n\n${passingText}\n\n${pendingText}${failingChecksText}\n\n` +
       `All checks (name: [attempt conclusions in order]):\n${allChecksAttempts}\n\n` +
       `## Reviewer threads\n\n` +
@@ -412,12 +420,13 @@ for (const pr of prs) {
           ? `${rejectedApprovalRunIds.length} run(s) rejected by gate: ${rejectedApprovalRunIds.join(', ')}`
           : '(No approval-gate issues.)'
       ) +
-      `\n\nYour action vocabulary: ready | ping | rerun | wait | escalate.\n` +
+      `\n\nYour action vocabulary: ready | ping | rerun | wait | escalate | update-pr.\n` +
       `- ready: PR meets DoD, all checks passing, no open threads on current head\n` +
-      `- ping: Send a fix instruction to the Copilot agent (include "instruction" field and "obstacleKey" field: "check:<normname>" or "thread:<id>")\n` +
+      `- ping: Send a fix instruction to the Copilot agent (include "instruction" field and "obstacleKey" field: "check:<normname>" or "thread:<id>"). The agent CANNOT edit the PR title/description — never ping for those; use update-pr.\n` +
       `- rerun: Re-run flaky checks (include "checks" array with exact check names)\n` +
       `- wait: Nothing actionable right now (CI pending, or watching something)\n` +
-      `- escalate: PR needs human intervention (include "obstacleKey" field and "reason" field with human-readable explanation)\n\n` +
+      `- escalate: PR needs human intervention (include "obstacleKey" field and "reason" field with human-readable explanation)\n` +
+      `- update-pr: Correct an inaccurate PR title/description yourself (include "newTitle" and/or "newBody"; set "obstacleKey" to the driving "thread:<id>" if a reviewer thread prompted it). newBody must be the COMPLETE description, preserving all current content except the fix.\n\n` +
       `Diff under review:\n\`\`\`diff\n${getDiff(n)}\n\`\`\``;
     // Three-layer parse tolerates a proxy that ignores --json-schema: prefer the
     // already-parsed object / clean JSON string, then fall back to extracting the
@@ -438,7 +447,7 @@ for (const pr of prs) {
     }
 
     // Seatbelt: validate the action enum; anything unexpected → wait.
-    let action = ['ready', 'ping', 'rerun', 'wait', 'escalate'].includes(out.action) ? out.action : 'wait';
+    let action = ['ready', 'ping', 'rerun', 'wait', 'escalate', 'update-pr'].includes(out.action) ? out.action : 'wait';
     if (action !== out.action) console.log(`::warning::#${n}: model returned unknown action "${out.action}" → treating as wait`);
 
     // Sanitize model-proposed thread resolutions: only ids that match a REAL
@@ -505,6 +514,59 @@ for (const pr of prs) {
         decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'ping', action: 'ping', obstacleKey, instruction, reason: out.reason || 'model: action required on this PR' });
         console.log('  → ping');
       }
+      continue;
+    }
+
+    if (action === 'update-pr') {
+      // Model judged the PR title/description inaccurate and supplied corrected
+      // text — something the Copilot coding agent cannot do itself. Deterministic
+      // code applies it verbatim (same "model owns content, code executes" pattern
+      // as resolveThreads); it never originates the text.
+      const newTitle = String(out.newTitle || '').trim();
+      const newBody = String(out.newBody || '');
+      if (!newTitle && !newBody.trim()) {
+        console.log('  → wait (update-pr but neither newTitle nor newBody supplied)');
+        decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: 'update-pr with no new title or body → wait' });
+        continue;
+      }
+      // Reuse the obstacle-cap ledger: an update-pr driven by a thread that keeps
+      // re-appearing (edit didn't satisfy the reviewer) escalates after the cap
+      // instead of re-editing forever. Unkeyed updates fall back to a pr-level key.
+      // Validate any thread:<id> key against real gathered copilot-reviewer threads
+      // (same sanitization as resolveThreads at line ~462): apply resolves this
+      // thread verbatim, so an unvetted id could silently resolve a human's thread
+      // and let the PR reach ready over unaddressed feedback. Unknown id → fall
+      // back to the pr-level key so no bogus thread is carried into apply.
+      const rawObstacle = String(out.obstacleKey || '').trim();
+      let obstacleKey = rawObstacle || `update-pr:${n}`;
+      if (rawObstacle.startsWith('thread:')) {
+        const tid = rawObstacle.slice('thread:'.length);
+        if (!copilotThreadIds.has(tid)) {
+          console.log(`::warning::#${n}: update-pr obstacleKey "${rawObstacle}" is not a known copilot-reviewer thread → falling back to update-pr:${n} (no thread will be resolved)`);
+          obstacleKey = `update-pr:${n}`;
+        }
+      }
+      const attemptCount = countAttempts(obstacleKey, headOid);
+      if (attemptCount >= 2) {
+        if (hasEscalated(obstacleKey, headOid)) {
+          console.log(`  → skip (already escalated for ${obstacleKey} on ${headOid})`);
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'skip', action: 'skip', obstacleKey, reason: 'already escalated for this obstacle on this head' });
+        } else {
+          console.log(`  → escalate (update-pr obstacle cap reached: ${attemptCount} attempts for ${obstacleKey})`);
+          decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'escalate', action: 'escalate', obstacleKey, reason: `Obstacle cap reached after ${attemptCount} update-pr attempts: ${obstacleKey} unresolved on ${headOid}` });
+        }
+        continue;
+      }
+      // Carry the assess-time snapshot (currentTitle/currentBody) so apply can do
+      // an optimistic-concurrency check before overwriting — a human may have
+      // edited the description between assess and apply.
+      decisions.push({
+        ...base, headOid, modelAction: out.action, appliedAction: 'update-pr', action: 'update-pr',
+        obstacleKey, newTitle, newBody,
+        currentTitle: prTitle, currentBody: prBody,
+        reason: out.reason || 'correcting inaccurate PR title/description',
+      });
+      console.log('  → update-pr');
       continue;
     }
 
