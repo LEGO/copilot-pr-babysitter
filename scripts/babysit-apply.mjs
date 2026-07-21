@@ -142,7 +142,13 @@ function applyResolveThreads(d, tag) {
     if (dryRun) { console.log(`  [dry-run] ${tag}: would resolve thread ${rt.id}: ${reasonText}`); continue; }
     try {
       postComment(d.prNumber, `🤖 Babysitter resolved this thread: ${reasonText}`, ghRead);
-      resolveReviewThread(rt.id, ghRead);
+      // resolveReviewThread needs a USER-attributed token (ghCopilot). The default
+      // GITHUB_TOKEN (ghRead) fails this GraphQL mutation with "Resource not
+      // accessible by integration" REGARDLESS of pull-requests:write — same
+      // restriction as markReady/requestReview. Using ghRead here silently no-ops
+      // every pushback, so the ready gate below re-sees the "unresolved" thread
+      // forever and the PR loops (observed on #58630).
+      resolveReviewThread(rt.id, ghCopilot);
       console.log(`  ${tag}: resolved review thread ${rt.id} (${reasonText})`);
     } catch (e) {
       console.log(`::warning::${tag}: could not resolve thread ${rt.id} (${String(e.message || e).slice(0, 160)})`);
@@ -479,7 +485,9 @@ for (const d of decisions) {
         const threadId = d.obstacleKey.slice('thread:'.length);
         try {
           postComment(d.prNumber, `🤖 Babysitter updated the PR ${changed} to address this: ${String(d.reason || '').slice(0, 200)}`, ghRead);
-          resolveReviewThread(threadId, ghRead);
+          // ghCopilot, not ghRead — resolveReviewThread needs a user-attributed
+          // token (see applyResolveThreads above).
+          resolveReviewThread(threadId, ghCopilot);
           console.log(`  ${tag}: resolved driving thread ${threadId} after update-pr`);
         } catch (e) {
           // Body edit already landed; a failed resolve just leaves the thread open,
@@ -504,6 +512,18 @@ for (const d of decisions) {
         const blockComments = ghJson(['api', '--paginate', `repos/${owner}/${repo}/issues/${d.prNumber}/comments`], ghRead)
           .map((c) => ({ body: c.body, createdAt: c.created_at, author: c.user?.login ?? null }));
         const blockMarkers = parseMarkers(blockComments);
+        // Escalation is terminal for THIS head: once we've handed off to a human,
+        // there is nothing new to say until the head moves (a fix arrives). Check
+        // FIRST and short-circuit — otherwise the attempt-marker post below runs
+        // every tick and spams a fresh (minimized) comment forever, climbing
+        // 3/2, 4/2, 5/2… long after we gave up (observed on #58630).
+        const alreadyEscalated = blockMarkers.some((m) =>
+          m.kind === 'escalated' && m.data?.obstacle === obstacleKey && m.data?.head === d.headOid && BABYSITTER_MARKER_AUTHORS.has(m.author));
+        if (alreadyEscalated) {
+          console.log(`  ${tag}: ready-block already escalated for ${obstacleKey} on ${d.headOid} — nothing to do (${liveThreads.length} thread(s) still open)`);
+          skipped++;
+          continue;
+        }
         const priorAttempts = blockMarkers.filter((m) =>
           m.kind === 'attempt' && m.data?.obstacle === obstacleKey && m.data?.head === d.headOid && BABYSITTER_MARKER_AUTHORS.has(m.author));
         const n = priorAttempts.length + 1;
@@ -521,32 +541,26 @@ for (const d of decisions) {
           console.log(`::warning::${tag}: could not post/minimize ready-block attempt marker (${String(markerErr.message || markerErr).slice(0, 120)})`);
         }
         if (n >= 2) {
-          const alreadyEscalated = blockMarkers.some((m) =>
-            m.kind === 'escalated' && m.data?.obstacle === obstacleKey && m.data?.head === d.headOid && BABYSITTER_MARKER_AUTHORS.has(m.author));
-          if (!alreadyEscalated) {
-            await notifyTeams(
-              `🚨 PR #${d.prNumber} ready blocked by unresolved reviewer threads`,
-              [
-                { title: 'PR', value: `#${d.prNumber}` },
-                { title: 'Title', value: d.title },
-                { title: 'Unresolved threads', value: String(liveThreads.length) },
-                { title: 'Head', value: d.headOid || 'unknown' },
-              ],
-              d.url,
-            ).catch(() => {});
-            // Marker first, then visible text (see the main escalate branch) so
-            // the PR shows why ready is blocked rather than a blank comment.
-            postComment(
-              d.prNumber,
-              `${buildMarker('escalated', { data: { obstacle: obstacleKey, head: d.headOid } })}\n`
-                + `🚨 Babysitter escalated this to a human via Teams — ready is blocked by `
-                + `${liveThreads.length} unresolved Copilot reviewer thread(s) that ${liveThreads.length === 1 ? 'has' : 'have'} not been resolved after 2 attempts.`,
-              ghRead,
-            );
-            escalated++;
-          } else {
-            console.log(`  ${tag}: already escalated ready-block for ${obstacleKey} on ${d.headOid}`);
-          }
+          await notifyTeams(
+            `🚨 PR #${d.prNumber} ready blocked by unresolved reviewer threads`,
+            [
+              { title: 'PR', value: `#${d.prNumber}` },
+              { title: 'Title', value: d.title },
+              { title: 'Unresolved threads', value: String(liveThreads.length) },
+              { title: 'Head', value: d.headOid || 'unknown' },
+            ],
+            d.url,
+          ).catch(() => {});
+          // Marker first, then visible text (see the main escalate branch) so
+          // the PR shows why ready is blocked rather than a blank comment.
+          postComment(
+            d.prNumber,
+            `${buildMarker('escalated', { data: { obstacle: obstacleKey, head: d.headOid } })}\n`
+              + `🚨 Babysitter escalated this to a human via Teams — ready is blocked by `
+              + `${liveThreads.length} unresolved Copilot reviewer thread(s) that ${liveThreads.length === 1 ? 'has' : 'have'} not been resolved after 2 attempts.`,
+            ghRead,
+          );
+          escalated++;
         }
         skipped++;
         continue;
