@@ -78,6 +78,19 @@ function resolveReviewThread(threadId, as) {
   }
   throw new Error(`resolveReviewThread ${threadId} failed after 3 attempts: ${String(lastErr?.stderr || lastErr?.message || lastErr).slice(0, 200)}`);
 }
+// Post the babysitter's rationale as a REPLY inside the review thread (rather
+// than a top-level PR comment) so it sits in context next to the comment it
+// addresses, instead of getting lost in the main conversation. Unlike
+// resolveReviewThread, this mutation works fine under GITHUB_TOKEN (ghRead) —
+// no user-attributed token needed — so we keep the author as the bot. The
+// body can contain arbitrary text (quotes, newlines, backticks), so it MUST
+// be passed as a GraphQL variable, never string-interpolated into the query.
+function replyToReviewThread(threadId, body, as) {
+  const q = `mutation($threadId:ID!,$body:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId, body:$body}){ comment{ id } } }`;
+  const out = JSON.parse(gh(['api', 'graphql', '-f', `query=${q}`, '-f', `threadId=${threadId}`, '-f', `body=${body}`], as));
+  if (out.errors) throw new Error(`replyToReviewThread: ${JSON.stringify(out.errors).slice(0, 200)}`);
+  return out;
+}
 // Re-fetch the CURRENT review-thread state for the ready gate (postcondition
 // check just before posting the ready card). assess.mjs never vetoes ready on
 // threads — this is the sole enforcement point, and it must see the freshest
@@ -141,7 +154,11 @@ function applyResolveThreads(d, tag) {
     const reasonText = String(rt.reason || '').trim() || 'judged unnecessary/incorrect by the babysitter';
     if (dryRun) { console.log(`  [dry-run] ${tag}: would resolve thread ${rt.id}: ${reasonText}`); continue; }
     try {
-      postComment(d.prNumber, `🤖 Babysitter resolved this thread: ${reasonText}`, ghRead);
+      try {
+        replyToReviewThread(rt.id, `🤖 Babysitter resolved this thread: ${reasonText}`, ghRead);
+      } catch (replyErr) {
+        console.log(`::warning::${tag}: could not reply to thread ${rt.id} (${String(replyErr.message || replyErr).slice(0, 160)})`);
+      }
       // resolveReviewThread needs a USER-attributed token (ghCopilot). The default
       // GITHUB_TOKEN (ghRead) fails this GraphQL mutation with "Resource not
       // accessible by integration" REGARDLESS of pull-requests:write — same
@@ -484,7 +501,11 @@ for (const d of decisions) {
       if (d.obstacleKey?.startsWith('thread:')) {
         const threadId = d.obstacleKey.slice('thread:'.length);
         try {
-          postComment(d.prNumber, `🤖 Babysitter updated the PR ${changed} to address this: ${String(d.reason || '').slice(0, 200)}`, ghRead);
+          try {
+            replyToReviewThread(threadId, `🤖 Babysitter updated the PR ${changed} to address this: ${String(d.reason || '').slice(0, 200)}`, ghRead);
+          } catch (replyErr) {
+            console.log(`::warning::${tag}: could not reply to thread ${threadId} (${String(replyErr.message || replyErr).slice(0, 160)})`);
+          }
           // ghCopilot, not ghRead — resolveReviewThread needs a user-attributed
           // token (see applyResolveThreads above).
           resolveReviewThread(threadId, ghCopilot);
