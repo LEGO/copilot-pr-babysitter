@@ -9,13 +9,16 @@
 //   1. Idempotency gate: ping only if newest copilot_work_started is NEWER than
 //      our newest ping-marker. Else -> skip (Copilot working, or already pinged
 //      and not yet started — our own marker closes the ~90s trigger-lag race).
-//   2. Comments FIRST (they preempt CI: a fix-commit re-triggers CI anyway).
-//      Unresolved copilot-pull-request-reviewer threads -> Claude synthesises a
-//      single instruction -> action "ping".
-//   3. CI only when the comment queue is empty. Claude attributes each failing
-//      check from diff + log tail: flaky -> "rerun"; caused-by-pr -> "ping".
-//   4. Terminal: idle AND no unresolved reviewer threads AND CI green AND not
-//      already posted -> action "ready".
+//   2. The MODEL owns the judgement. It receives all evidence and chooses one
+//      action per tick under a review-first precedence: address reviewer threads
+//      before rerunning CI, because a fix-commit re-triggers CI anyway. That
+//      precedence is INSTRUCTED in scripts/babysit-prompt.md ("Work in this
+//      order") and ENFORCED as a boundary here by two suppress-only vetoes below
+//      (search "Review-first precedence"): while an unaddressed current-head
+//      reviewer thread exists, a model `rerun` or `ready` is downgraded to wait.
+//   3. Terminal: model `ready`, snapshot complete, no unaddressed reviewer
+//      threads, and the current head reviewed -> action "ready" (else undraft /
+//      request-review follow-through).
 //
 // Claude is read-only (Read/Grep/Glob, no network): it reasons over text this
 // script gathers; the apply step performs every mutation.
@@ -465,6 +468,30 @@ for (const pr of prs) {
       })
       .map((rt) => ({ id: rt.id, reason: String(rt.reason || '').trim() }));
     if (resolveThreads.length > 0) base.resolveThreads = resolveThreads;
+
+    // Review-first precedence, enforced as a boundary (the prompt asks for it; this
+    // makes non-compliance harmless). An unaddressed current-head reviewer thread is
+    // a live copilot-pull-request-reviewer thread the model is neither pinging to fix
+    // nor pushing back on via resolveThreads. While one exists: (a) `rerun` is
+    // wasteful — a fix commit re-triggers CI anyway — so downgrade it to wait; (b)
+    // `ready` is a false-ready — so downgrade it to wait. Both are suppress-only: we
+    // never fabricate a ping (the model is the sole originator of pings).
+    const resolvingIds = new Set(resolveThreads.map((rt) => rt.id));
+    const unaddressedThreads = threads.filter(
+      (t) => t.author === COPILOT_REVIEWER && !t.isResolved && !t.isStale && !resolvingIds.has(t.id)
+    );
+
+    if (action === 'rerun' && unaddressedThreads.length > 0) {
+      console.log(`  → wait (rerun vetoed: ${unaddressedThreads.length} unaddressed reviewer thread(s) on current head — a fix commit will re-trigger CI)`);
+      decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: `rerun vetoed: ${unaddressedThreads.length} unaddressed current-head reviewer thread(s) — review-first precedence` });
+      continue;
+    }
+
+    if (action === 'ready' && unaddressedThreads.length > 0) {
+      console.log(`  → wait (ready vetoed: ${unaddressedThreads.length} unaddressed reviewer thread(s) on current head)`);
+      decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: `ready vetoed: ${unaddressedThreads.length} unaddressed current-head reviewer thread(s) — not addressed and not pushed back on` });
+      continue;
+    }
 
     if (action === 'rerun') {
       // Model judged the failing check(s) flaky. Resolve names to real failing

@@ -105,11 +105,43 @@ Return one `action`:
   only failing check is policy-exempt/human-gated, or CI is still running, and no
   thread needs action).
 
+### Work in this order
+
+The actions are not a menu to pick from freely. When more than one is live,
+resolve them in this sequence — a later step is only reachable once every
+earlier step is clean:
+
+1. **Reviewer threads first.** For every unresolved thread on the current head,
+   decide its disposition: it needs a **fix** (→ `ping`, or `update-pr` if it is
+   only a title/description inaccuracy) or it is **wrong/unnecessary** (→ list it
+   in `resolveThreads` with grounded reasoning). Every current-head reviewer
+   thread must land in exactly one of those two buckets.
+2. **A required fix means no `rerun`.** If any thread needs a fix, a commit is
+   coming, and that commit re-triggers CI on its own. Do **not** `rerun` this
+   tick — even for an obviously flaky check. Issue the `ping` and let the fix
+   commit re-run CI for you.
+3. **Fold CI source-fixes into that same `ping`.** If a CI failure needs a real
+   repository change and you are already pinging for a thread, combine both into
+   one self-contained instruction. One coding cycle, not two.
+4. **`rerun` is reachable only when the thread queue is empty** — every
+   current-head thread resolved or credibly pushed back on — **and** the sole
+   remaining obstacle is a check you can justify as transient (see `rerun`).
+5. **`wait`** when nothing is actionable: threads clean, and the only failing
+   checks are still-pending or policy-exempt/human-gated.
+6. **`ready`** only when the Definition of Done holds — none of 1–5 apply.
+
+`escalate` is independent of this ladder: the moment an obstacle is genuinely
+stuck (a human/external system, or one that has resisted repeated attempts),
+escalate it regardless of what else is open.
+
 Ground every call in the diff, logs, and attempt history. Weigh the cost of
-being wrong — **a false `ready` is worse than an unnecessary `rerun`, which is
-worse than an unnecessary `ping`.** When actions are in tension, prefer the one
-whose failure mode is cheapest: never declare `ready` to avoid a `ping`, and
-never `rerun` a deterministic failure to avoid an `escalate`.
+being wrong. **A false `ready` is the most expensive mistake — worse than any
+unnecessary action.** Between the two fixable actions, an unnecessary `rerun` is
+worse than an unnecessary `ping`: a `rerun` spends a capped, finite resource and
+buys nothing when a commit is already coming, whereas an unnecessary `ping` at
+worst hands the coding agent a no-op. Never declare `ready` to avoid a `ping`;
+never `rerun` a deterministic failure to avoid an `escalate`; and never `rerun`
+while a reviewer thread still needs action.
 
 ### Output shape
 
