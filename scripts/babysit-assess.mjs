@@ -84,7 +84,7 @@ function getComments(number) {
 // oids: a thread raised against a commit other than the current head is STALE
 // (superseded by a later fix); "clean" = the reviewer has reviewed the current
 // head and that review round left no thread against the head.
-function getReviewState(number) {
+function fetchReviewState(number) {
   const data = ghGraphql(`
     { repository(owner:"${owner}", name:"${repo}") { pullRequest(number:${number}) {
       id
@@ -102,14 +102,28 @@ function getReviewState(number) {
         isResolved
         comments(first:1){ nodes { author{login} body path pullRequestReview{ commit{oid} } } }
       } } } } }`, ghOpts);
-  const pr = data.repository.pullRequest;
+  return data.repository.pullRequest;
+}
+
+function getReviewState(number) {
+  let pr = fetchReviewState(number);
+  let mergeability = classifyMergeability(pr);
+  // GitHub initially answers UNKNOWN while it creates the synthetic merge
+  // commit used to compute this field. The next query normally has the result;
+  // retry once before treating the snapshot as incomplete.
+  if (!mergeability.hasConflict && !mergeability.isKnown) {
+    console.log(`  mergeability: GitHub returned UNKNOWN for #${number}; retrying`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+    pr = fetchReviewState(number);
+    mergeability = classifyMergeability(pr);
+  }
   const copilotSuggested = (pr.suggestedReviewers || []).find((s) => s.reviewer?.login === 'Copilot');
   return {
     prNodeId: pr.id,
     isDraft: pr.isDraft,
     headOid: pr.headRefOid,
     baseRefName: pr.baseRefName || '',
-    mergeability: classifyMergeability(pr),
+    mergeability,
     prTitle: pr.title || '',
     prBody: pr.body || '',
     copilotReviewerId: copilotSuggested?.reviewer?.id || null, // requestable bot id, if offered
@@ -309,7 +323,7 @@ for (const pr of prs) {
     // signal: it must be repaired and re-reviewed before a human can rely on the
     // original ready notification.
     const alreadyPosted = newestReady && (!workStarted || newestReady >= workStarted);
-    if (alreadyPosted && !mergeability.hasConflict) {
+    if (alreadyPosted && mergeability.isKnown && !mergeability.hasConflict) {
       console.log('  already posted ready + no new work or merge conflict since → skip');
       decisions.push({ ...base, action: 'skip', reason: 'ready already posted' });
       continue;
