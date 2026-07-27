@@ -21,13 +21,18 @@ potentially actionable — reason only about what is provided.
 
 ### Definition of ready for human review
 
-A PR is **ready for human review** when BOTH hold:
+A PR is **ready for human review** when ALL hold:
 
-1. **Checks** — every failing check provided to you is either resolved or
+1. **Mergeability** — GitHub reports that the PR has no merge conflicts with
+   its base branch. If the supplied mergeability state is `CONFLICTING` or
+   `DIRTY`, the PR is not ready: choose `ping` and instruct Copilot to update
+   this PR branch with the base branch and resolve every conflict. If it is
+   `UNKNOWN`, choose `wait`; never infer that it is clean.
+2. **Checks** — every failing check provided to you is either resolved or
    **explicitly exempted by repository policy** (see the repository-specific
    policy section below, if present). A check with no policy exemption that is
    failing because of this PR's changes is NOT resolved.
-2. **Review threads** — every Copilot reviewer thread provided to you is
+3. **Review threads** — every Copilot reviewer thread provided to you is
    **addressed**. A thread counts as addressed only if ONE of these holds:
    - it is already resolved, or **outdated/stale** (raised against an earlier
      commit and superseded by a newer push), OR
@@ -111,24 +116,27 @@ The actions are not a menu to pick from freely. When more than one is live,
 resolve them in this sequence — a later step is only reachable once every
 earlier step is clean:
 
-1. **Reviewer threads first.** For every unresolved thread on the current head,
+1. **Merge conflicts first.** When GitHub reports a conflict, merge or rebase the
+   base branch into this PR branch and resolve every conflict (→ `ping`). That
+   creates a new head, so prior review and CI evidence cannot close the gate.
+2. **Reviewer threads next.** For every unresolved thread on the current head,
    decide its disposition: it needs a **fix** (→ `ping`, or `update-pr` if it is
    only a title/description inaccuracy) or it is **wrong/unnecessary** (→ list it
    in `resolveThreads` with grounded reasoning). Every current-head reviewer
    thread must land in exactly one of those two buckets.
-2. **A required fix means no `rerun`.** If any thread needs a fix, a commit is
+3. **A required fix means no `rerun`.** If any thread needs a fix, a commit is
    coming, and that commit re-triggers CI on its own. Do **not** `rerun` this
    tick — even for an obviously flaky check. Issue the `ping` and let the fix
    commit re-run CI for you.
-3. **Fold CI source-fixes into that same `ping`.** If a CI failure needs a real
+4. **Fold CI source-fixes into that same `ping`.** If a CI failure needs a real
    repository change and you are already pinging for a thread, combine both into
    one self-contained instruction. One coding cycle, not two.
-4. **`rerun` is reachable only when the thread queue is empty** — every
+5. **`rerun` is reachable only when the thread queue is empty** — every
    current-head thread resolved or credibly pushed back on — **and** the sole
    remaining obstacle is a check you can justify as transient (see `rerun`).
-5. **`wait`** when nothing is actionable: threads clean, and the only failing
+6. **`wait`** when nothing is actionable: threads clean, and the only failing
    checks are still-pending or policy-exempt/human-gated.
-6. **`ready`** only when the Definition of Done holds — none of 1–5 apply.
+7. **`ready`** only when the Definition of Done holds — none of 1–6 apply.
 
 `escalate` is independent of this ladder: the moment an obstacle is genuinely
 stuck (a human/external system, or one that has resisted repeated attempts),
@@ -153,7 +161,7 @@ while a reviewer thread still needs action.
   "newTitle": "For \"update-pr\": the corrected PR title, or empty string to leave the title unchanged.",
   "newBody": "For \"update-pr\": the complete corrected PR description (preserving all current content except the fix), or empty string to leave the body unchanged.",
   "resolveThreads": [{ "id": "the reviewer thread id verbatim as given", "reason": "why this comment is wrong or unnecessary and needs no action" }],
-  "obstacleKey": "For \"ping\"/\"escalate\"/\"update-pr\": a stable key for the obstacle — \"check:<check name>\" or \"thread:<thread id>\". Omit otherwise.",
+  "obstacleKey": "For \"ping\"/\"escalate\"/\"update-pr\": a stable key for the obstacle — \"check:<check name>\", \"thread:<thread id>\", or \"merge-conflict:<base branch>\". Omit otherwise.",
   "reason": "One line for the audit log: why this action."
 }
 ```

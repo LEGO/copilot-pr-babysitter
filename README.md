@@ -7,21 +7,22 @@ It's the second half of an autonomous flow: [`jira-claude-triage`](https://githu
 On each run (you own the cron), for every open Copilot PR matching your title identifier:
 
 1. **Idempotency gate** — is Copilot mid-flight, or have we already pinged and it hasn't started yet? If so, hands off.
-2. **Review comments first** — reviewer threads raised against the **current head** → a fresh **read-only Claude session** synthesises a concrete fix instruction → **`@copilot` ping**.
-3. **CI next** (only when the comment queue is empty) — Claude attributes each failing check: **flaky** → re-run the job (capped); **caused by the PR** → `@copilot` ping to fix.
-4. **Un-draft to trigger review** — Copilot opens PRs as drafts and **only reviews once a PR is marked ready for review**. So when a draft is idle with green CI, the babysitter marks it ready (`gh pr ready`) to trigger the Copilot review. This is programmatic — the draft is not a manual gate.
-5. **Re-request review** — Copilot does **not** auto-re-review after a fix commit. So when the current head hasn't been reviewed yet, the babysitter explicitly re-requests the Copilot review (`requestReviews` GraphQL mutation).
-6. **Ready for a human** — the Copilot reviewer has reviewed the **current head**, that review left no thread against the head, and CI is green → post a **Teams "ready for review"** card and stop.
+2. **Merge conflicts first** — a `DIRTY` / `CONFLICTING` PR is re-armed, even after a prior ready card, and Copilot is asked to update the branch with its base and resolve the conflicts.
+3. **Review comments next** — reviewer threads raised against the **current head** → a fresh **read-only Claude session** synthesises a concrete fix instruction → **`@copilot` ping**.
+4. **CI next** (only when the comment queue is empty) — Claude attributes each failing check: **flaky** → re-run the job (capped); **caused by the PR** → `@copilot` ping to fix.
+5. **Un-draft to trigger review** — Copilot opens PRs as drafts and **only reviews once a PR is marked ready for review**. So when a draft is idle with green CI, the babysitter marks it ready (`gh pr ready`) to trigger the Copilot review. This is programmatic — the draft is not a manual gate.
+6. **Re-request review** — Copilot does **not** auto-re-review after a fix commit. So when the current head hasn't been reviewed yet, the babysitter explicitly re-requests the Copilot review (`requestReviews` GraphQL mutation).
+7. **Ready for a human** — GitHub reports no merge conflict, the Copilot reviewer has reviewed the **current head**, that review left no thread against the head, and CI is green → post a **Teams "ready for review"** card.
 
 ```
 cron / manual dispatch (in YOUR workflow)
   → fetch open Copilot PRs matching <title-pattern>
-  → per PR:  idempotency gate → threads-on-head? → CI? → draft? → head reviewed?
+  → per PR:  idempotency gate → mergeable? → threads-on-head? → CI? → draft? → head reviewed?
        ping       : @copilot <instruction>       (+ hidden ping-marker = race guard)
        rerun      : gh run rerun --failed         (+ hidden rerun-marker, capped)
        undraft    : gh pr ready  (triggers the first Copilot review)
        req-review : requestReviews  (re-triggers review of the current head)
-       ready      : Teams "ready for review" card (+ hidden ready-marker = re-arm anchor)
+       ready      : Teams "ready for review" card (+ hidden ready-marker; conflicts re-arm it)
 ```
 
 ### Why commit oids, not `isResolved`
@@ -52,7 +53,7 @@ So once we've pinged, we never ping again until we can see Copilot actually star
 
 ## Re-arm after "ready"
 
-Once a PR is posted as ready, a human may still ping Copilot for nits. That produces a fresh `copilot_work_started` **after** our ready-marker, which re-arms the PR: the babysitter picks it up again, drives it clean, and re-posts. A ready PR with no new Copilot work since the ready-marker is left alone.
+Once a PR is posted as ready, a human may still ping Copilot for nits. That produces a fresh `copilot_work_started` **after** our ready-marker, which re-arms the PR. A later base-branch update that creates a GitHub merge conflict also re-arms it, so Copilot resolves the conflict and the usual CI/review loop runs again. A ready PR with neither new Copilot work nor a merge conflict is left alone.
 
 ## Usage
 

@@ -30,7 +30,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import {
   gh, ghJson, ghGraphql, COPILOT_REVIEWER,
-  parseMarkers, newestOf, groupChecks, BABYSITTER_MARKER_AUTHORS,
+  parseMarkers, newestOf, groupChecks, classifyMergeability, BABYSITTER_MARKER_AUTHORS,
 } from './lib.mjs';
 
 const { ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, BABYSIT_MODEL, GITHUB_TOKEN, GITHUB_REPOSITORY } = process.env;
@@ -90,6 +90,9 @@ function getReviewState(number) {
       id
       isDraft
       headRefOid
+      baseRefName
+      mergeable
+      mergeStateStatus
       title
       body
       suggestedReviewers { reviewer { login id } }
@@ -105,6 +108,8 @@ function getReviewState(number) {
     prNodeId: pr.id,
     isDraft: pr.isDraft,
     headOid: pr.headRefOid,
+    baseRefName: pr.baseRefName || '',
+    mergeability: classifyMergeability(pr),
     prTitle: pr.title || '',
     prBody: pr.body || '',
     copilotReviewerId: copilotSuggested?.reviewer?.id || null, // requestable bot id, if offered
@@ -287,21 +292,29 @@ for (const pr of prs) {
     if (!idle) { console.log('  gate: Copilot mid-flight → skip'); decisions.push({ ...base, action: 'skip', reason: 'copilot working' }); continue; }
     if (pingOutstanding) { console.log('  gate: ping outstanding, not yet started → skip'); decisions.push({ ...base, action: 'skip', reason: 'ping not yet picked up' }); continue; }
 
-    // Re-arm note: if a PR was already marked ready, we only continue past here
-    // when new Copilot work happened after that ready-marker (human nits →
-    // work_started). Otherwise it's terminal-and-quiet → skip (don't re-post).
-    const alreadyPosted = newestReady && (!workStarted || newestReady >= workStarted);
-    if (alreadyPosted) { console.log('  already posted ready + no new work since → skip'); decisions.push({ ...base, action: 'skip', reason: 'ready already posted' }); continue; }
-
-    // (2) Comments first.
-    let isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId, prTitle, prBody;
+    // Read current mergeability before the ready-marker gate. A base-branch push
+    // can turn a previously-ready PR DIRTY without creating Copilot work, so the
+    // old re-arm signal alone would otherwise leave the conflict invisible.
+    let isDraft, headOid, baseRefName, mergeability, reviews, threads, prNodeId, copilotReviewerId, prTitle, prBody;
     try {
-      ({ isDraft, headOid, reviews, threads, prNodeId, copilotReviewerId, prTitle, prBody } = getReviewState(n));
+      ({ isDraft, headOid, baseRefName, mergeability, reviews, threads, prNodeId, copilotReviewerId, prTitle, prBody } = getReviewState(n));
     } catch (e) {
       gathererFailed = true;
       console.log(`::warning::#${n}: getReviewState failed: ${e.message}`);
       throw e; // still fatal — we need headOid; propagate to outer catch
     }
+
+    // Re-arm note: after a ready card, leave quiet PRs alone unless the live
+    // mergeability check found a conflict. A conflict is an independent re-arm
+    // signal: it must be repaired and re-reviewed before a human can rely on the
+    // original ready notification.
+    const alreadyPosted = newestReady && (!workStarted || newestReady >= workStarted);
+    if (alreadyPosted && !mergeability.hasConflict) {
+      console.log('  already posted ready + no new work or merge conflict since → skip');
+      decisions.push({ ...base, action: 'skip', reason: 'ready already posted' });
+      continue;
+    }
+    if (mergeability.hasConflict) console.log(`  mergeability: ${baseRefName || 'base branch'} has conflicts → re-armed`);
 
     let checks, incomplete, unknownConclusions, approvalRunIds, rejectedApprovalRunIds;
     try {
@@ -398,6 +411,15 @@ for (const pr of prs) {
     const task =
       `Decide the next action for this GitHub Copilot pull request against the Definition of Done in your instructions.\n\n` +
       `PR #${n}: ${pr.title}\nHead commit: ${headOid}\n\n` +
+      `## Mergeability\n\n` +
+      `GitHub mergeable: ${mergeability.hasConflict ? 'CONFLICTING' : mergeability.isKnown ? 'MERGEABLE' : 'UNKNOWN'}\n` +
+      `GitHub merge-state: ${mergeability.hasConflict ? 'DIRTY' : mergeability.isKnown ? 'known non-conflicting state' : 'UNKNOWN'}\n` +
+      `Base branch: ${baseRefName || '(unknown)'}\n` +
+      (mergeability.hasConflict
+        ? 'This PR has merge conflicts with its base branch. It is not ready: choose ping and instruct Copilot to update this PR branch with the base branch and resolve every conflict.\n\n'
+        : !mergeability.isKnown
+          ? 'GitHub has not finished computing mergeability. Do not choose ready; wait for a later run.\n\n'
+          : 'GitHub reports no merge conflict.\n\n') +
       `## Current PR title and description (for the \"update-pr\" action)\n\n` +
       `Current title:\n${prTitle}\n\nCurrent description:\n\`\`\`\n${prBody || '(empty)'}\n\`\`\`\n\n` +
       `## CI Checks\n\n${passingText}\n\n${pendingText}${failingChecksText}\n\n` +
@@ -424,8 +446,8 @@ for (const pr of prs) {
           : '(No approval-gate issues.)'
       ) +
       `\n\nYour action vocabulary: ready | ping | rerun | wait | escalate | update-pr.\n` +
-      `- ready: PR meets DoD, all checks passing, no open threads on current head\n` +
-      `- ping: Send a fix instruction to the Copilot agent (include "instruction" field and "obstacleKey" field: "check:<normname>" or "thread:<id>"). The agent CANNOT edit the PR title/description — never ping for those; use update-pr.\n` +
+      `- ready: PR meets DoD, is mergeable without conflicts, all checks passing, no open threads on current head\n` +
+      `- ping: Send a fix instruction to the Copilot agent (include "instruction" field and "obstacleKey" field: "check:<normname>", "thread:<id>", or "merge-conflict:<base branch>"). The agent CANNOT edit the PR title/description — never ping for those; use update-pr.\n` +
       `- rerun: Re-run flaky checks (include "checks" array with exact check names)\n` +
       `- wait: Nothing actionable right now (CI pending, or watching something)\n` +
       `- escalate: PR needs human intervention (include "obstacleKey" field and "reason" field with human-readable explanation)\n` +
@@ -493,6 +515,18 @@ for (const pr of prs) {
       continue;
     }
 
+    // GitHub's mergeability data is part of the readiness contract. Fail closed
+    // while it is still being calculated, and never surface a conflicted branch
+    // as ready even if the model misses the mergeability instruction.
+    if (action === 'ready' && (!mergeability.isKnown || mergeability.hasConflict)) {
+      const reason = mergeability.hasConflict
+        ? 'ready vetoed: GitHub reports merge conflicts with the base branch'
+        : 'ready vetoed: GitHub mergeability is still unknown';
+      console.log(`  → wait (${reason})`);
+      decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason });
+      continue;
+    }
+
     if (action === 'rerun') {
       // Model judged the failing check(s) flaky. Resolve names to real failing
       // checks and apply the rerun cap. Over-cap or unnamed → wait (suppress-only;
@@ -527,7 +561,12 @@ for (const pr of prs) {
         decisions.push({ ...base, headOid, modelAction: out.action, appliedAction: 'wait', action: 'skip', reason: 'ping with empty instruction → wait' });
         continue;
       }
-      const obstacleKey = String(out.obstacleKey || '').trim() || `pr:${n}`;
+      // Merge conflicts are a stable, first-class obstacle. Pinning the ledger
+      // key to the base branch prevents a model spelling variation from bypassing
+      // the attempt cap while retaining the existing per-head reset on a fix.
+      const obstacleKey = mergeability.hasConflict
+        ? `merge-conflict:${baseRefName || 'base'}`
+        : String(out.obstacleKey || '').trim() || `pr:${n}`;
       const attemptCount = countAttempts(obstacleKey, headOid);
       if (attemptCount >= 2) {
         if (hasEscalated(obstacleKey, headOid)) {

@@ -96,6 +96,20 @@ export function parseMarkers(comments) {
 }
 export const newestOf = (dates) => (dates.length ? new Date(Math.max(...dates.map((d) => +d))) : null);
 
+// GitHub can return UNKNOWN while it is computing mergeability. Treat that as
+// incomplete data, never as evidence that a PR can safely be handed to a human.
+// A DIRTY merge-state is authoritative even if the mergeable enum is still
+// catching up, so surface it as a conflict immediately.
+export function classifyMergeability({ mergeable, mergeStateStatus } = {}) {
+  const hasConflict = mergeable === 'CONFLICTING' || mergeStateStatus === 'DIRTY';
+  const isKnown = !hasConflict
+    && Boolean(mergeable)
+    && Boolean(mergeStateStatus)
+    && mergeable !== 'UNKNOWN'
+    && mergeStateStatus !== 'UNKNOWN';
+  return { hasConflict, isKnown };
+}
+
 // -------- CI classification (REST) --------
 // We read CI from two REST endpoints (both need only checks:read / statuses:read),
 // avoiding gh's statusCheckRollup GraphQL which requires broader integration
